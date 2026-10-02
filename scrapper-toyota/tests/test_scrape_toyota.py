@@ -2,25 +2,237 @@ import unittest
 from datetime import date
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from openpyxl import Workbook, load_workbook
 
 from scrape_toyota import (
     load_results,
+    crawl_msrp,
     detail_status,
     detail_url_matches_oem,
+    dismiss_blocking_popups,
     is_toyota_site_url,
     normalize_part_number,
     parse_msrp,
+    parse_product_msrp,
     prepare_crawl_rows,
     read_oem_values,
     resolve_column,
     save_results,
     status_is_complete,
+    wait_for_product_detail,
+    wait_for_product_msrp,
+    wait_for_product_suggestion,
 )
 
 
 class CrawlerHelpersTests(unittest.TestCase):
+    def test_crawl_clicks_product_suggestion_before_reading_detail_msrp(self):
+        steps = []
+
+        class SearchBox:
+            def fill(self, value):
+                steps.append(f"fill:{value}")
+
+        class Suggestion:
+            def click(self, timeout):
+                steps.append("suggestion_click")
+
+        def dismiss(page, press_escape=True):
+            steps.append(f"dismiss:{press_escape}")
+
+        product_text = "Toyota Genuine #81110-02M70\nRight Hand Headlamp\nMSRP $1,103.12"
+        with (
+            patch("scrape_toyota.dismiss_blocking_popups", side_effect=dismiss),
+            patch("scrape_toyota.find_search_box", return_value=SearchBox()),
+            patch(
+                "scrape_toyota.wait_for_product_suggestion",
+                side_effect=lambda page: steps.append("suggestion_wait") or Suggestion(),
+            ),
+            patch(
+                "scrape_toyota.wait_for_human_verification",
+                side_effect=lambda page, failures: steps.append("verification_wait"),
+            ),
+            patch(
+                "scrape_toyota.wait_for_product_detail",
+                side_effect=lambda page: steps.append("detail_wait") or True,
+            ),
+            patch(
+                "scrape_toyota.wait_for_product_msrp",
+                side_effect=lambda page: steps.append("pdp_msrp_wait") or product_text,
+            ),
+        ):
+            msrp, status = crawl_msrp(object(), "8111002M70", [])
+
+        self.assertEqual((msrp, status), (1103.12, "success"))
+        self.assertEqual(
+            steps,
+            [
+                "dismiss:True",
+                "fill:8111002M70",
+                "suggestion_wait",
+                "suggestion_click",
+                "verification_wait",
+                "detail_wait",
+                "dismiss:True",
+                "pdp_msrp_wait",
+            ],
+        )
+
+    def test_wait_for_product_detail_after_suggestion_click_navigation(self):
+        class Product:
+            def __init__(self, page):
+                self.page = page
+
+            def count(self):
+                return 1 if self.page.waits >= 2 else 0
+
+            def is_visible(self):
+                return True
+
+            def inner_text(self, timeout):
+                return "Toyota Genuine #81110-02M70"
+
+        class Page:
+            waits = 0
+
+            @property
+            def url(self):
+                if self.waits >= 2:
+                    return "https://autoparts.toyota.com/products/product/headlamp-assy-rh-8111002m70"
+                return "https://autoparts.toyota.com/"
+
+            def locator(self, selector):
+                self.selector = selector
+                return Product(self)
+
+            def wait_for_timeout(self, milliseconds):
+                self.waits += 1
+
+        page = Page()
+
+        self.assertTrue(wait_for_product_detail(page, timeout_seconds=1))
+        self.assertGreaterEqual(page.waits, 2)
+        self.assertEqual(page.selector, 'main[aria-label="pdp container"]')
+
+    def test_wait_for_product_msrp_until_pdp_content_is_rendered(self):
+        class Product:
+            def __init__(self, page):
+                self.page = page
+
+            def count(self):
+                return 1
+
+            def is_visible(self):
+                return True
+
+            def inner_text(self, timeout):
+                if self.page.waits >= 2:
+                    return "Toyota Genuine #81110-02M70\\nMSRP $1,103.12"
+                return "Toyota Genuine #81110-02M70"
+
+        class Page:
+            waits = 0
+
+            def locator(self, selector):
+                self.selector = selector
+                return Product(self)
+
+            def wait_for_timeout(self, milliseconds):
+                self.waits += 1
+
+        page = Page()
+        product_text = wait_for_product_msrp(page, timeout_seconds=1)
+
+        self.assertIn("MSRP $1,103.12", product_text)
+        self.assertGreaterEqual(page.waits, 2)
+        self.assertEqual(page.selector, 'main[aria-label="pdp container"]')
+
+    def test_popup_dismissal_does_not_send_escape_when_preserving_suggestion(self):
+        class Button:
+            def is_visible(self):
+                return True
+
+            def is_enabled(self):
+                return True
+
+            def click(self, timeout):
+                self.page.dismissed += 1
+
+            def __init__(self, page):
+                self.page = page
+
+        class Buttons:
+            def __init__(self, page):
+                self.page = page
+
+            def count(self):
+                return 1 if self.page.dismissed == 0 else 0
+
+            def nth(self, index):
+                return Button(self.page)
+
+        class Keyboard:
+            def __init__(self, page):
+                self.page = page
+
+            def press(self, key):
+                self.page.keys.append(key)
+
+        class Page:
+            def __init__(self):
+                self.dismissed = 0
+                self.keys = []
+                self.keyboard = Keyboard(self)
+
+            def locator(self, selector):
+                return Buttons(self)
+
+        page = Page()
+        dismiss_blocking_popups(page, press_escape=False)
+
+        self.assertEqual(page.dismissed, 1)
+        self.assertEqual(page.keys, [])
+
+    def test_wait_for_product_suggestion_until_it_becomes_visible(self):
+        class Suggestion:
+            def is_visible(self):
+                return True
+
+            def get_attribute(self, name):
+                return "https://autoparts.toyota.com/products/product/headlamp-assy-lh-8115002m90"
+
+            def inner_text(self):
+                return "Left Hand Headlamp Assembly"
+
+        class Suggestions:
+            def __init__(self, page):
+                self.page = page
+
+            def count(self):
+                return 1 if self.page.waits >= 2 else 0
+
+            def nth(self, index):
+                return Suggestion()
+
+        class Page:
+            waits = 0
+
+            def locator(self, selector):
+                self.selector = selector
+                return Suggestions(self)
+
+            def wait_for_timeout(self, milliseconds):
+                self.waits += 1
+
+        page = Page()
+        suggestion = wait_for_product_suggestion(page, timeout_seconds=1)
+
+        self.assertIsNotNone(suggestion)
+        self.assertGreaterEqual(page.waits, 2)
+        self.assertIn('text-is("Product suggestions")', page.selector)
+
     def test_normalize_part_number_ignores_punctuation_and_case(self):
         self.assertEqual(normalize_part_number("90915-YZZF2"), "90915YZZF2")
 
@@ -53,9 +265,13 @@ class CrawlerHelpersTests(unittest.TestCase):
             "success_superseded: 90915-YZZN1",
         )
 
+    def test_category_label_is_not_mistaken_for_replacement_part(self):
+        self.assertEqual(detail_status("Clearance\\nMSRP $1,104.45", "8115002M90", 1104.45), "success")
+
     def test_only_successful_statuses_are_complete(self):
         self.assertTrue(status_is_complete("success"))
         self.assertTrue(status_is_complete("success_superseded: 90915-YZZN1"))
+        self.assertFalse(status_is_complete("success_superseded: Clearance"))
         self.assertFalse(status_is_complete("not_found"))
         self.assertFalse(status_is_complete("msrp_not_found"))
         self.assertFalse(status_is_complete("error: TimeoutError"))
@@ -88,6 +304,13 @@ class CrawlerHelpersTests(unittest.TestCase):
 
     def test_parse_msrp_requires_an_msrp_label(self):
         self.assertIsNone(parse_msrp("Price: $123.45"))
+
+    def test_parse_product_msrp_ignores_unrelated_disclosure_prices(self):
+        text = (
+            "Toyota Genuine #81110-02M70\nRight Hand Headlamp\nMSRP $1,103.12\n"
+            "Warranty details: battery MSRP $99.00"
+        )
+        self.assertEqual(parse_product_msrp(text), 1103.12)
 
     def test_resolve_column_supports_header_and_excel_letter(self):
         workbook = Workbook()

@@ -9,7 +9,7 @@ import time
 import urllib.request
 from datetime import date
 from pathlib import Path
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import unquote, urlparse
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font
@@ -26,6 +26,10 @@ from playwright.sync_api import (
 
 SITE_URL = "https://autoparts.toyota.com/"
 SEARCH_INPUT_SELECTOR = "#searchByKeywordsID"
+PRODUCT_SUGGESTION_SELECTOR = (
+    'div.product__header:has(span.product__heading:text-is("Product suggestions")) '
+    'a[href*="/products/product/"]'
+)
 CDP_PORT = 9233
 MAX_CRAWL_ATTEMPTS = 3
 OUTPUT_HEADERS = ("OEM Number", "MSRP", "Date", "Status")
@@ -48,6 +52,13 @@ def parse_msrp(text: str) -> float | None:
     if match is None:
         return None
     return float(match.group(1).replace(",", ""))
+
+
+def parse_product_msrp(text: str) -> float | None:
+    product_heading = re.search(r"(?i)Toyota Genuine\s+#?[A-Z0-9-]+", text)
+    if product_heading is None:
+        return None
+    return parse_msrp(text[product_heading.start() : product_heading.start() + 800])
 
 
 def resolve_column(sheet, column: str, header_row: int) -> tuple[int, int]:
@@ -114,6 +125,33 @@ def find_search_box(page: Page) -> Locator | None:
             return search_box
         page.wait_for_timeout(250)
     return None
+
+
+def dismiss_blocking_popups(page: Page, press_escape: bool = True) -> None:
+    close_buttons = page.locator(
+        'button[aria-label*="close" i], button[title*="close" i], '
+        'button[aria-label*="dismiss" i], button:has-text("Close"), '
+        'button:has-text("Dismiss"), button:has-text("Not now"), button:has-text("No thanks")'
+    )
+    for _ in range(20):
+        dismissed = False
+        for index in range(close_buttons.count()):
+            button = close_buttons.nth(index)
+            try:
+                if button.is_visible() and button.is_enabled():
+                    button.click(timeout=1_500)
+                    dismissed = True
+                    break
+            except PlaywrightError:
+                continue
+        if not dismissed:
+            break
+
+    if press_escape:
+        try:
+            page.keyboard.press("Escape")
+        except PlaywrightError:
+            pass
 
 
 def page_needs_human_verification(page: Page) -> bool:
@@ -208,6 +246,66 @@ def wait_for_matching_result(page: Page, oem_number: object, timeout_seconds: fl
         page.wait_for_timeout(min(500, int(remaining * 1_000)))
 
 
+def wait_for_product_suggestion(page: Page, timeout_seconds: float = 12) -> Locator | None:
+    suggestions = page.locator(PRODUCT_SUGGESTION_SELECTOR)
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        for index in range(suggestions.count()):
+            suggestion = suggestions.nth(index)
+            try:
+                if (
+                    suggestion.is_visible()
+                    and suggestion.get_attribute("href")
+                    and suggestion.inner_text().strip()
+                ):
+                    return suggestion
+            except PlaywrightError:
+                continue
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        page.wait_for_timeout(min(250, max(1, int(remaining * 1_000))))
+
+
+def is_product_detail_page(page: Page) -> bool:
+    if not urlparse(page.url).path.startswith("/products/product/"):
+        return False
+    product = page.locator('main[aria-label="pdp container"]')
+    if not product.count() or not product.is_visible():
+        return False
+    detail_text = product.inner_text(timeout=2_000)
+    return bool(
+        re.search(r"(?i)Toyota Genuine\s+#?[A-Z0-9-]+", detail_text)
+        or re.search(r"(?im)^Part Number\s+[A-Z0-9-]+\s*$", detail_text)
+    )
+
+
+def wait_for_product_detail(page: Page, timeout_seconds: float = 20) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        if is_product_detail_page(page):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        page.wait_for_timeout(min(250, max(1, int(remaining * 1_000))))
+
+
+def wait_for_product_msrp(page: Page, timeout_seconds: float = 20) -> str:
+    product = page.locator('main[aria-label="pdp container"]')
+    deadline = time.monotonic() + timeout_seconds
+    latest_text = ""
+    while True:
+        if product.count() and product.is_visible():
+            latest_text = product.inner_text(timeout=2_000)
+            if parse_product_msrp(latest_text) is not None:
+                return latest_text
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return latest_text
+        page.wait_for_timeout(min(500, max(1, int(remaining * 1_000))))
+
+
 def is_matching_detail_page(page: Page, oem_number: object) -> bool:
     expected = normalize_part_number(oem_number)
     if not expected:
@@ -239,7 +337,7 @@ def detail_status(body_text: str, oem_number: object, msrp: float | None) -> str
         return "msrp_not_found"
     part_number_match = re.search(r"(?i)Toyota Genuine\s+#?([A-Z0-9-]+)", body_text)
     if part_number_match is None:
-        part_number_match = re.search(r"(?im)^#?([A-Z0-9-]+)\s*$", body_text)
+        part_number_match = re.search(r"(?im)^Part Number\s+([A-Z0-9-]+)\s*$", body_text)
     current_part = part_number_match.group(1) if part_number_match else ""
     if current_part and normalize_part_number(current_part) != normalize_part_number(oem_number):
         return f"success_superseded: {current_part}"
@@ -251,6 +349,7 @@ def crawl_msrp(
     oem_number: object,
     challenge_failures: list[str],
 ) -> tuple[float | None, str]:
+    dismiss_blocking_popups(page)
     search_box = find_search_box(page)
     if search_box is None:
         if page_needs_human_verification(page):
@@ -262,38 +361,45 @@ def crawl_msrp(
             )
 
     search_box.fill(str(oem_number).strip())
-    search_box.press("Enter")
-    try:
-        page.wait_for_load_state("domcontentloaded", timeout=20_000)
-    except PlaywrightTimeoutError:
-        pass
+    suggestion_link = wait_for_product_suggestion(page)
+    if suggestion_link is not None:
+        try:
+            suggestion_link.click(timeout=10_000)
+        except PlaywrightTimeoutError:
+            print(f"  Product suggestion for {oem_number!s} could not be clicked.")
+            return None, f"error: suggestion click timed out for {oem_number!s}"
+    else:
+        search_box.press("Enter")
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=20_000)
+        except PlaywrightTimeoutError:
+            pass
+        wait_for_human_verification(page, challenge_failures)
+
+        if not is_matching_detail_page(page, oem_number):
+            result_link = wait_for_matching_result(page, oem_number)
+            if result_link is None:
+                print(f"  No result link matched OEM {oem_number!s}.")
+                return None, "not_found"
+
+            dismiss_blocking_popups(page)
+            try:
+                result_link.click(timeout=10_000)
+            except PlaywrightTimeoutError:
+                print(f"  Product result for {oem_number!s} could not be clicked.")
+                return None, f"error: result click timed out for {oem_number!s}"
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=30_000)
+            except PlaywrightTimeoutError:
+                pass
+
     wait_for_human_verification(page, challenge_failures)
-
-    if is_matching_detail_page(page, oem_number):
-        detail_text = page.locator("body").inner_text(timeout=15_000)
-        price = parse_msrp(detail_text)
-        if price is None:
-            print(f"  Detail page opened, but no MSRP label/value was found for {oem_number!s}.")
-        else:
-            print(f"  MSRP: ${price:,.2f}")
-        return price, detail_status(detail_text, oem_number, price)
-
-    result_link = wait_for_matching_result(page, oem_number)
-    if result_link is None:
-        print(f"  No result link matched OEM {oem_number!s}.")
-        return None, "not_found"
-
-    result_href = result_link.get_attribute("href")
-    if not result_href:
-        print(f"  Matching result for {oem_number!s} had no detail URL.")
-        return None, "not_found"
-    try:
-        page.goto(urljoin(page.url, result_href), wait_until="domcontentloaded", timeout=30_000)
-    except PlaywrightTimeoutError:
-        pass
-    wait_for_human_verification(page, challenge_failures)
-    detail_text = page.locator("body").inner_text(timeout=15_000)
-    price = parse_msrp(detail_text)
+    if not wait_for_product_detail(page):
+        print(f"  Product detail did not open after searching {oem_number!s}.")
+        return None, f"error: product detail page did not open for {oem_number!s}"
+    dismiss_blocking_popups(page)
+    detail_text = wait_for_product_msrp(page)
+    price = parse_product_msrp(detail_text)
     if price is None:
         print(f"  Detail page opened, but no MSRP label/value was found for {oem_number!s}.")
     else:
@@ -357,7 +463,14 @@ def load_results(output_path: Path) -> list[tuple[object, float | None, date, st
 
 
 def status_is_complete(status: str) -> bool:
-    return status.casefold().startswith("success")
+    if status.casefold() == "success":
+        return True
+    replacement_match = re.fullmatch(
+        r"success_superseded:\s*([A-Z0-9][A-Z0-9-]*)",
+        status.strip(),
+        re.IGNORECASE,
+    )
+    return bool(replacement_match and re.search(r"\d", replacement_match.group(1)))
 
 
 def prepare_crawl_rows(
