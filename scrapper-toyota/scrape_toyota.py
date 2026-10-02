@@ -348,6 +348,7 @@ def crawl_msrp(
     page: Page,
     oem_number: object,
     challenge_failures: list[str],
+    attempt_on_search: bool = False,
 ) -> tuple[float | None, str]:
     dismiss_blocking_popups(page)
     search_box = find_search_box(page)
@@ -369,6 +370,9 @@ def crawl_msrp(
             print(f"  Product suggestion for {oem_number!s} could not be clicked.")
             return None, f"error: suggestion click timed out for {oem_number!s}"
     else:
+        if not attempt_on_search:
+            print(f"  No product suggestion appeared for {oem_number!s}; search fallback is disabled.")
+            return None, "not_found"
         search_box.press("Enter")
         try:
             page.wait_for_load_state("domcontentloaded", timeout=20_000)
@@ -473,6 +477,12 @@ def status_is_complete(status: str) -> bool:
     return bool(replacement_match and re.search(r"\d", replacement_match.group(1)))
 
 
+def should_retry_crawl(status: str, attempt_on_search: bool) -> bool:
+    if status_is_complete(status):
+        return False
+    return not (status == "not_found" and not attempt_on_search)
+
+
 def prepare_crawl_rows(
     oem_values: list[object],
     previous_results: list[tuple[object, float | None, date, str]],
@@ -554,6 +564,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, help="Output workbook (default: <input>_results.xlsx).")
     parser.add_argument("--sheet", help="Worksheet name (default: active worksheet).")
     parser.add_argument("--chrome-path", type=Path, help="Path to installed Google Chrome executable.")
+    parser.add_argument(
+        "--attempt-on-search",
+        action="store_true",
+        help="Submit a full search and inspect result cards if no autocomplete product suggestion appears (default: disabled).",
+    )
     crawl_mode = parser.add_mutually_exclusive_group()
     crawl_mode.add_argument(
         "--resume",
@@ -669,7 +684,12 @@ def main() -> int:
                         f"(attempt {attempt}/{MAX_CRAWL_ATTEMPTS})"
                     )
                     try:
-                        msrp, status = crawl_msrp(page, oem_number, challenge_failures)
+                        msrp, status = crawl_msrp(
+                            page,
+                            oem_number,
+                            challenge_failures,
+                            attempt_on_search=args.attempt_on_search,
+                        )
                     except HumanVerificationError as error:
                         print(f"Crawl stopped: {error}", file=sys.stderr)
                         return 1
@@ -682,7 +702,7 @@ def main() -> int:
                     results[row_index] = result_row
                     save_results(output_path, results)
 
-                    if status_is_complete(status):
+                    if not should_retry_crawl(status, args.attempt_on_search):
                         break
                     if attempt < MAX_CRAWL_ATTEMPTS:
                         print(f"  Status {status!r} is not successful; retrying shortly.")

@@ -20,6 +20,7 @@ from scrape_toyota import (
     read_oem_values,
     resolve_column,
     save_results,
+    should_retry_crawl,
     status_is_complete,
     wait_for_product_detail,
     wait_for_product_msrp,
@@ -28,6 +29,81 @@ from scrape_toyota import (
 
 
 class CrawlerHelpersTests(unittest.TestCase):
+    def test_search_fallback_is_disabled_by_default(self):
+        with patch("sys.argv", ["scrape_toyota.py", "--input", "parts.xlsx", "--column", "A"]):
+            from scrape_toyota import parse_args
+
+            args = parse_args()
+
+        self.assertFalse(args.attempt_on_search)
+
+    def test_search_fallback_flag_enables_full_search(self):
+        with patch(
+            "sys.argv",
+            ["scrape_toyota.py", "--input", "parts.xlsx", "--column", "A", "--attempt-on-search"],
+        ):
+            from scrape_toyota import parse_args
+
+            args = parse_args()
+
+        self.assertTrue(args.attempt_on_search)
+
+    def test_not_found_advances_to_next_oem_without_search_fallback(self):
+        self.assertFalse(should_retry_crawl("not_found", attempt_on_search=False))
+
+    def test_not_found_retries_when_search_fallback_is_enabled(self):
+        self.assertTrue(should_retry_crawl("not_found", attempt_on_search=True))
+
+    def test_success_never_retries(self):
+        self.assertFalse(should_retry_crawl("success", attempt_on_search=True))
+
+    def test_missing_product_suggestion_does_not_submit_search_by_default(self):
+        steps = []
+
+        class SearchBox:
+            def fill(self, value):
+                steps.append(f"fill:{value}")
+
+            def press(self, key):
+                steps.append(f"press:{key}")
+
+        with (
+            patch("scrape_toyota.dismiss_blocking_popups"),
+            patch("scrape_toyota.find_search_box", return_value=SearchBox()),
+            patch("scrape_toyota.wait_for_product_suggestion", return_value=None),
+        ):
+            msrp, status = crawl_msrp(object(), "8115002M90", [])
+
+        self.assertEqual((msrp, status), (None, "not_found"))
+        self.assertEqual(steps, ["fill:8115002M90"])
+
+    def test_missing_product_suggestion_submits_search_when_enabled(self):
+        steps = []
+
+        class SearchBox:
+            def fill(self, value):
+                steps.append(f"fill:{value}")
+
+            def press(self, key):
+                steps.append(f"press:{key}")
+
+        class Page:
+            def wait_for_load_state(self, state, timeout):
+                steps.append(f"load:{state}")
+
+        with (
+            patch("scrape_toyota.dismiss_blocking_popups"),
+            patch("scrape_toyota.find_search_box", return_value=SearchBox()),
+            patch("scrape_toyota.wait_for_product_suggestion", return_value=None),
+            patch("scrape_toyota.wait_for_human_verification"),
+            patch("scrape_toyota.is_matching_detail_page", return_value=False),
+            patch("scrape_toyota.wait_for_matching_result", return_value=None),
+        ):
+            msrp, status = crawl_msrp(Page(), "8115002M90", [], attempt_on_search=True)
+
+        self.assertEqual((msrp, status), (None, "not_found"))
+        self.assertIn("press:Enter", steps)
+
     def test_crawl_clicks_product_suggestion_before_reading_detail_msrp(self):
         steps = []
 
