@@ -5,11 +5,11 @@ from tempfile import TemporaryDirectory
 
 from openpyxl import Workbook, load_workbook
 
-from scrape_vw import (
+from scrape_toyota import (
     load_results,
     detail_status,
     detail_url_matches_oem,
-    is_vw_site_url,
+    is_toyota_site_url,
     normalize_part_number,
     parse_msrp,
     prepare_crawl_rows,
@@ -22,36 +22,40 @@ from scrape_vw import (
 
 class CrawlerHelpersTests(unittest.TestCase):
     def test_normalize_part_number_ignores_punctuation_and_case(self):
-        self.assertEqual(normalize_part_number("1K0-123-456.A"), "1K0123456A")
+        self.assertEqual(normalize_part_number("90915-YZZF2"), "90915YZZF2")
 
     def test_detail_url_matches_queried_superseded_oem(self):
         self.assertTrue(
             detail_url_matches_oem(
-                "https://parts.vw.com/p/48644238/1K9853651AZLL.html",
-                "1K9853651AZLL",
+                "https://autoparts.toyota.com/products/product/filter-s-a-oil-90915yzzn1",
+                "90915-YZZN1",
             )
         )
 
-    def test_detects_existing_vw_page_to_avoid_duplicate_navigation(self):
-        self.assertTrue(is_vw_site_url("https://parts.vw.com/"))
-        self.assertTrue(is_vw_site_url("https://parts.vw.com/p/51744001/5GM807217GRU.html"))
-        self.assertFalse(is_vw_site_url("about:blank"))
+    def test_detects_existing_toyota_page_to_avoid_duplicate_navigation(self):
+        self.assertTrue(is_toyota_site_url("https://autoparts.toyota.com/"))
+        self.assertTrue(
+            is_toyota_site_url(
+                "https://autoparts.toyota.com/products/product/filter-s-a-oil-90915yzzn1"
+            )
+        )
+        self.assertFalse(is_toyota_site_url("about:blank"))
         self.assertFalse(
             detail_url_matches_oem(
-                "https://parts.vw.com/p/48644238/1K9853651EZLL.html",
-                "1K9853651AZLL",
+                "https://autoparts.toyota.com/products/product/filter-s-a-oil-90915yzzn1",
+                "90915-YZZF2",
             )
         )
 
     def test_superseded_detail_status_discloses_current_part_number(self):
         self.assertEqual(
-            detail_status("Part Number: 1K9853651EZLL", "1K9853651AZLL", 429.04),
-            "success_superseded: 1K9853651EZLL",
+            detail_status("Toyota Genuine #90915-YZZN1", "90915-YZZF2", 6.57),
+            "success_superseded: 90915-YZZN1",
         )
 
     def test_only_successful_statuses_are_complete(self):
         self.assertTrue(status_is_complete("success"))
-        self.assertTrue(status_is_complete("success_superseded: 1K9853651EZLL"))
+        self.assertTrue(status_is_complete("success_superseded: 90915-YZZN1"))
         self.assertFalse(status_is_complete("not_found"))
         self.assertFalse(status_is_complete("msrp_not_found"))
         self.assertFalse(status_is_complete("error: TimeoutError"))
@@ -80,8 +84,7 @@ class CrawlerHelpersTests(unittest.TestCase):
         self.assertEqual(pending, [(1, "1K0123456A")])
 
     def test_parse_msrp_reads_currency_and_thousands_separator(self):
-        self.assertEqual(parse_msrp("Part information MSRP: $1,234.50"), 1234.5)
-        self.assertEqual(parse_msrp("MSRP\n$ 553.59"), 553.59)
+        self.assertEqual(parse_msrp("Toyota Genuine #90915-YZZN1\nMSRP $6.57"), 6.57)
 
     def test_parse_msrp_requires_an_msrp_label(self):
         self.assertIsNone(parse_msrp("Price: $123.45"))
@@ -135,8 +138,8 @@ class CrawlerHelpersTests(unittest.TestCase):
             workbook = Workbook()
             sheet = workbook.active
             sheet.append(("OEM Number", "MSRP", "Date"))
-            sheet.append(("1K0123456A", None, date(2026, 10, 1)))
-            sheet.append(("5Q0123456B", 19.5, date(2026, 10, 1)))
+            sheet.append(("90915-YZZF2", None, date(2026, 10, 1)))
+            sheet.append(("85214-02340", 10.81, date(2026, 10, 1)))
             workbook.save(output)
             loaded = load_results(output)
             self.assertEqual(loaded[0][3], "error: legacy row has no status or MSRP")

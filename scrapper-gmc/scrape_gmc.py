@@ -7,7 +7,7 @@ import subprocess
 import sys
 import time
 import urllib.request
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlparse
 
@@ -24,15 +24,11 @@ from playwright.sync_api import (
 )
 
 
-SITE_URL = "https://parts.vw.com/"
-SEARCH_INPUT_SELECTOR = "#SearchInput"
-CDP_PORT = 9233
+SITE_URL = "https://parts.gmparts.com/"
+SEARCH_INPUT_SELECTOR = "#search-bar-standalone"
+CDP_PORT = 9234
 MAX_CRAWL_ATTEMPTS = 3
 OUTPUT_HEADERS = ("OEM Number", "MSRP", "Date", "Status")
-MSRP_PATTERN = re.compile(
-    r"\bMSRP\b\s*(?:\([^)]*\))?\s*:?\s*\$?\s*([0-9][0-9,]*(?:\.\d{1,2})?)",
-    re.IGNORECASE,
-)
 
 
 class HumanVerificationError(RuntimeError):
@@ -44,14 +40,17 @@ def normalize_part_number(value: object) -> str:
 
 
 def parse_msrp(text: str) -> float | None:
-    match = MSRP_PATTERN.search(text)
+    match = re.search(
+        r"\bMSRP\b\s*[:\-]?\s*\$\s*([0-9][0-9,]*(?:\.\d{1,2})?)",
+        text,
+        re.IGNORECASE,
+    )
     if match is None:
         return None
     return float(match.group(1).replace(",", ""))
 
 
 def resolve_column(sheet, column: str, header_row: int) -> tuple[int, int]:
-    """Return the 1-based input column and first data row."""
     if header_row > 0:
         for index, cell in enumerate(sheet[header_row], start=1):
             if str(cell.value or "").strip().casefold() == column.strip().casefold():
@@ -100,42 +99,48 @@ def find_search_box(page: Page) -> Locator | None:
     search_box = page.locator(SEARCH_INPUT_SELECTOR)
     if search_box.count() and search_box.is_visible() and search_box.is_enabled():
         return search_box
-
-    search_toggle = page.locator("button.ssbtn")
-    if search_toggle.count() and search_toggle.is_visible() and search_toggle.is_enabled():
-        try:
-            search_toggle.click(timeout=3_000)
-        except PlaywrightTimeoutError:
-            search_toggle.evaluate("element => element.click()")
-
-    deadline = time.monotonic() + 8
-    while time.monotonic() < deadline:
-        if search_box.count() and search_box.is_visible() and search_box.is_enabled():
-            return search_box
-        page.wait_for_timeout(250)
+    fallback = page.get_by_role("searchbox", name=re.compile("product or part number", re.I))
+    if fallback.count() and fallback.is_visible() and fallback.is_enabled():
+        return fallback
     return None
 
 
+def dismiss_blocking_marketing_dialog(page: Page) -> None:
+    dialogs = page.get_by_role("dialog")
+    for index in range(dialogs.count()):
+        dialog = dialogs.nth(index)
+        if not dialog.is_visible():
+            continue
+        text = dialog.inner_text().casefold()
+        if "save now" not in text and "off" not in text:
+            continue
+        close_button = dialog.get_by_role("button", name=re.compile(r"^close$", re.I))
+        if close_button.count() and close_button.is_visible():
+            close_button.click(timeout=5_000)
+            page.wait_for_timeout(300)
+
+
 def page_needs_human_verification(page: Page) -> bool:
-    title = page.title().casefold()
-    body_text = page.locator("body").inner_text(timeout=15_000).casefold()
-    return (
-        "performing security verification" in body_text
-        or "security verification" in body_text
-        or "just a moment" in title
+    try:
+        title = page.title().casefold()
+        body = page.locator("body").inner_text(timeout=5_000).casefold()
+    except PlaywrightError:
+        return False
+    markers = (
+        "performing security verification",
+        "security verification",
+        "verify you are human",
+        "checking your browser",
+        "attention required",
     )
-
-
-def is_vw_site_url(url: str) -> bool:
-    return urlparse(url).hostname == urlparse(SITE_URL).hostname
+    return "just a moment" in title or any(marker in body for marker in markers)
 
 
 def wait_for_human_verification(page: Page, challenge_failures: list[str]) -> None:
     if not page_needs_human_verification(page):
         return
-
     print(
-        "Cloudflare is asking for human verification. Complete the check in the opened browser; "
+        "The site is asking for human verification. Complete it in the visible browser; "
         "the crawler will continue automatically.",
         flush=True,
     )
@@ -144,15 +149,11 @@ def wait_for_human_verification(page: Page, challenge_failures: list[str]) -> No
         while page_needs_human_verification(page):
             if challenge_failures:
                 raise HumanVerificationError(
-                    "Cloudflare's verification host failed to load: "
-                    f"{challenge_failures[-1]}. Check DNS, VPN, proxy, or firewall access to "
-                    "brunhild.challenges.cloudflare.com over HTTPS, then rerun the crawler."
+                    "A verification request failed: "
+                    f"{challenge_failures[-1]}. Check DNS, VPN, proxy, and firewall access."
                 )
             if time.monotonic() >= deadline:
-                raise HumanVerificationError(
-                    "Cloudflare verification did not clear within five minutes. "
-                    "The browser remains visible; check network access and try again."
-                )
+                raise HumanVerificationError("Human verification did not clear within five minutes.")
             page.wait_for_timeout(1_000)
     except PlaywrightError as error:
         if page.is_closed():
@@ -161,161 +162,131 @@ def wait_for_human_verification(page: Page, challenge_failures: list[str]) -> No
 
 
 def open_site(page: Page, challenge_failures: list[str]) -> None:
-    if not is_vw_site_url(page.url):
-        page.goto(SITE_URL, wait_until="domcontentloaded", timeout=60_000)
-    else:
-        try:
-            page.wait_for_load_state("domcontentloaded", timeout=30_000)
-        except PlaywrightTimeoutError:
-            pass
+    page.goto(SITE_URL, wait_until="domcontentloaded", timeout=60_000)
     wait_for_human_verification(page, challenge_failures)
+    dismiss_blocking_marketing_dialog(page)
+    try:
+        page.locator(SEARCH_INPUT_SELECTOR).wait_for(state="visible", timeout=30_000)
+    except PlaywrightTimeoutError:
+        pass
     if find_search_box(page) is None:
-        page_description = f"Title: {page.title()!r}; URL: {page.url}; "
-        body_excerpt = page.locator("body").inner_text(timeout=15_000).strip().replace("\n", " ")[:300]
+        excerpt = page.locator("body").inner_text(timeout=10_000).strip().replace("\n", " ")[:300]
         raise RuntimeError(
-            "The VW parts search box was not found after page load. "
-            f"{page_description}Page text: {body_excerpt!r}"
+            f"GM search box {SEARCH_INPUT_SELECTOR} was not found on {page.url!r}; "
+            f"title={page.title()!r}, page text={excerpt!r}"
         )
 
 
-def find_matching_result(page: Page, oem_number: object) -> Locator | None:
+def matching_product_link(page: Page, oem_number: object) -> Locator | None:
     expected = normalize_part_number(oem_number)
     if not expected:
         return None
 
-    links = page.locator("a[href]")
-    ranked_matches: list[tuple[int, int]] = []
+    links = page.locator('a[href*="/product/"]')
+    ranked: list[tuple[int, int]] = []
     for index in range(links.count()):
         link = links.nth(index)
-        if not link.is_visible():
+        try:
+            if not link.is_visible():
+                continue
+            text = link.inner_text().strip()
+            href = link.get_attribute("href") or ""
+        except PlaywrightError:
             continue
-        label = link.inner_text().strip()
-        href = link.get_attribute("href") or ""
-        normalized_label = normalize_part_number(label)
+        normalized_text = normalize_part_number(text)
         normalized_href = normalize_part_number(href)
-        if expected == normalized_label:
-            ranked_matches.append((0, index))
-        elif expected in normalized_label:
-            ranked_matches.append((1, index))
+        if re.search(rf"\bGM\s+Part\s*#?\s*{re.escape(str(oem_number))}\b", text, re.I):
+            ranked.append((0, index))
+        elif expected in normalized_text:
+            ranked.append((1, index))
         elif expected in normalized_href:
-            ranked_matches.append((2, index))
-
-    if not ranked_matches:
+            ranked.append((2, index))
+    if not ranked:
         return None
-    ranked_matches.sort()
-    return links.nth(ranked_matches[0][1])
+    ranked.sort()
+    return links.nth(ranked[0][1])
 
 
-def wait_for_matching_result(page: Page, oem_number: object, timeout_seconds: float = 12) -> Locator | None:
+def wait_for_matching_product(page: Page, oem_number: object, timeout_seconds: float = 15) -> Locator | None:
     deadline = time.monotonic() + timeout_seconds
     while True:
-        result_link = find_matching_result(page, oem_number)
-        if result_link is not None:
-            return result_link
+        link = matching_product_link(page, oem_number)
+        if link is not None:
+            return link
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return None
         page.wait_for_timeout(min(500, int(remaining * 1_000)))
 
 
-def is_matching_detail_page(page: Page, oem_number: object) -> bool:
+def product_url_matches_oem(url: str, oem_number: object) -> bool:
     expected = normalize_part_number(oem_number)
-    if not expected:
-        return False
+    segment = unquote(urlparse(url).path.rstrip("/").rsplit("/", 1)[-1])
+    return bool(expected and expected in normalize_part_number(segment))
 
-    if detail_url_matches_oem(page.url, oem_number):
+
+def is_matching_product_page(page: Page, oem_number: object, selected_text: str = "") -> bool:
+    if product_url_matches_oem(page.url, oem_number):
         return True
-
-    body_text = page.locator("body").inner_text(timeout=15_000)
-    part_number_match = re.search(r"(?im)^Part Number:\s*([^\s]+)", body_text)
-    if part_number_match and normalize_part_number(part_number_match.group(1)) == expected:
-        return True
-
-    supersession_match = re.search(r"(?im)^Supersession(?:\(s\))?:\s*(.+)$", body_text)
-    if supersession_match:
-        superseded_numbers = re.split(r"[;,]", supersession_match.group(1))
-        if any(normalize_part_number(number) == expected for number in superseded_numbers):
-            return True
-    return False
-
-
-def detail_url_matches_oem(url: str, oem_number: object) -> bool:
     expected = normalize_part_number(oem_number)
-    final_path_segment = unquote(urlparse(url).path.rstrip("/").rsplit("/", 1)[-1])
-    return bool(expected and final_path_segment.casefold().endswith(".html") and normalize_part_number(final_path_segment[:-5]) == expected)
+    return bool(expected and expected in normalize_part_number(selected_text))
 
 
-def detail_status(body_text: str, oem_number: object, msrp: float | None) -> str:
+def product_status(body_text: str, selected_text: str, oem_number: object, msrp: float | None) -> str:
     if msrp is None:
         return "msrp_not_found"
-    part_number_match = re.search(r"(?im)^Part Number:\s*([^\s]+)", body_text)
-    current_part = part_number_match.group(1) if part_number_match else ""
+    current_match = re.search(r"(?im)^GM Part\s*#\s*([^\s]+)", body_text)
+    current_part = current_match.group(1).strip("#") if current_match else ""
+    if not current_part:
+        current_match = re.search(r"(?im)^ACDelco Part\s*#\s*([^\s]+)", body_text)
+        current_part = current_match.group(1).strip("#") if current_match else ""
     if current_part and normalize_part_number(current_part) != normalize_part_number(oem_number):
         return f"success_superseded: {current_part}"
+    replaces_match = re.search(r"(?i)Replaces:\s*#?([A-Z0-9-]+)", selected_text)
+    if replaces_match and normalize_part_number(replaces_match.group(1)) == normalize_part_number(oem_number):
+        if current_part:
+            return f"success_superseded: {current_part}"
+        return "success_superseded"
     return "success"
 
 
-def crawl_msrp(
-    page: Page,
-    oem_number: object,
-    challenge_failures: list[str],
-) -> tuple[float | None, str]:
+def crawl_msrp(page: Page, oem_number: object, challenge_failures: list[str]) -> tuple[float | None, str]:
+    dismiss_blocking_marketing_dialog(page)
     search_box = find_search_box(page)
     if search_box is None:
         if page_needs_human_verification(page):
             wait_for_human_verification(page, challenge_failures)
             search_box = find_search_box(page)
         if search_box is None:
-            raise RuntimeError(
-                f"VW search is unavailable on {page.url!r} (page title: {page.title()!r})."
-            )
-
+            raise RuntimeError(f"GM search is unavailable on {page.url!r} ({page.title()!r}).")
+    search_box.click(timeout=5_000)
     search_box.fill(str(oem_number).strip())
-    submit_button = page.locator("#searchBtn")
-    if submit_button.count() and submit_button.is_visible() and submit_button.is_enabled():
-        try:
-            submit_button.click(timeout=3_000)
-        except PlaywrightTimeoutError:
-            submit_button.evaluate("element => element.click()")
-    else:
-        search_box.press("Enter")
+    product_link = wait_for_matching_product(page, oem_number)
+    if product_link is None:
+        print(f"  No matching GM product suggestion found for {oem_number!s}.")
+        return None, "not_found"
+
+    selected_text = product_link.inner_text().strip()
+    href = product_link.get_attribute("href")
+    if not href:
+        return None, "not_found"
+    product_url = urljoin(page.url, href)
     try:
-        page.wait_for_load_state("domcontentloaded", timeout=20_000)
+        page.goto(product_url, wait_until="domcontentloaded", timeout=30_000)
     except PlaywrightTimeoutError:
         pass
     wait_for_human_verification(page, challenge_failures)
-
-    if is_matching_detail_page(page, oem_number):
-        detail_text = page.locator("body").inner_text(timeout=15_000)
-        price = parse_msrp(detail_text)
-        if price is None:
-            print(f"  Detail page opened, but no MSRP label/value was found for {oem_number!s}.")
-        else:
-            print(f"  MSRP: ${price:,.2f}")
-        return price, detail_status(detail_text, oem_number, price)
-
-    result_link = wait_for_matching_result(page, oem_number)
-    if result_link is None:
-        print(f"  No result link matched OEM {oem_number!s}.")
+    page.wait_for_timeout(700)
+    if not is_matching_product_page(page, oem_number, selected_text):
         return None, "not_found"
 
-    result_href = result_link.get_attribute("href")
-    if not result_href:
-        print(f"  Matching result for {oem_number!s} had no detail URL.")
-        return None, "not_found"
-    try:
-        page.goto(urljoin(page.url, result_href), wait_until="domcontentloaded", timeout=30_000)
-    except PlaywrightTimeoutError:
-        pass
-    wait_for_human_verification(page, challenge_failures)
     detail_text = page.locator("body").inner_text(timeout=15_000)
     price = parse_msrp(detail_text)
     if price is None:
-        print(f"  Detail page opened, but no MSRP label/value was found for {oem_number!s}.")
+        print(f"  Product page loaded for {oem_number!s}, but its MSRP label was not found.")
     else:
         print(f"  MSRP: ${price:,.2f}")
-    status = detail_status(detail_text, oem_number, price)
-    return price, status
+    return price, product_status(detail_text, selected_text, oem_number, price)
 
 
 def save_results(output_path: Path, results: list[tuple[object, float | None, date, str]]) -> None:
@@ -331,10 +302,8 @@ def save_results(output_path: Path, results: list[tuple[object, float | None, da
         sheet.cell(sheet.max_row, 3).number_format = "yyyy-mm-dd"
     sheet.freeze_panes = "A2"
     sheet.auto_filter.ref = sheet.dimensions
-    sheet.column_dimensions["A"].width = 22
-    sheet.column_dimensions["B"].width = 14
-    sheet.column_dimensions["C"].width = 14
-    sheet.column_dimensions["D"].width = 24
+    for column, width in (("A", 22), ("B", 14), ("C", 14), ("D", 32)):
+        sheet.column_dimensions[column].width = width
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = output_path.with_name(f"{output_path.stem}.tmp{output_path.suffix}")
     try:
@@ -350,12 +319,11 @@ def load_results(output_path: Path) -> list[tuple[object, float | None, date, st
     workbook = load_workbook(output_path, read_only=True, data_only=True)
     try:
         sheet = workbook.active
-        header = [str(cell or "").strip().casefold() for cell in next(sheet.iter_rows(min_row=1, max_row=1, values_only=True))]
-        indexes = {name: header.index(name) for name in ("oem number", "msrp", "date") if name in header}
-        if "oem number" not in indexes:
+        header_row = next(sheet.iter_rows(min_row=1, max_row=1, values_only=True), ())
+        header = [str(value or "").strip().casefold() for value in header_row]
+        if "oem number" not in header:
             return []
-        has_status = "status" in header
-        status_index = header.index("status") if has_status else -1
+        indexes = {name: header.index(name) for name in ("oem number", "msrp", "date", "status") if name in header}
         loaded: list[tuple[object, float | None, date, str]] = []
         for row in sheet.iter_rows(min_row=2, values_only=True):
             oem_number = row[indexes["oem number"]] if indexes["oem number"] < len(row) else None
@@ -363,7 +331,7 @@ def load_results(output_path: Path) -> list[tuple[object, float | None, date, st
                 continue
             msrp = row[indexes["msrp"]] if "msrp" in indexes and indexes["msrp"] < len(row) else None
             crawled_on = row[indexes["date"]] if "date" in indexes and indexes["date"] < len(row) else date.today()
-            status = str(row[status_index] or "").strip() if has_status and status_index < len(row) else ""
+            status = str(row[indexes["status"]] or "").strip() if "status" in indexes and indexes["status"] < len(row) else ""
             if not status:
                 status = "success" if msrp is not None else "error: legacy row has no status or MSRP"
             loaded.append((oem_number, msrp, crawled_on, status))
@@ -405,7 +373,6 @@ def find_chrome(custom_path: Path | None = None) -> Path | None:
     if custom_path is not None:
         candidate = custom_path.expanduser().resolve()
         return candidate if candidate.is_file() else None
-
     candidates = [
         Path(os.environ.get("PROGRAMFILES", "C:/Program Files")) / "Google/Chrome/Application/chrome.exe",
         Path(os.environ.get("PROGRAMFILES(X86)", "C:/Program Files (x86)")) / "Google/Chrome/Application/chrome.exe",
@@ -426,12 +393,8 @@ def start_chrome(chrome_path: Path, profile_path: Path) -> subprocess.Popen:
     profile_path.mkdir(parents=True, exist_ok=True)
     process = subprocess.Popen(
         [
-            str(chrome_path),
-            f"--remote-debugging-port={CDP_PORT}",
-            f"--user-data-dir={profile_path}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            SITE_URL,
+            str(chrome_path), f"--remote-debugging-port={CDP_PORT}",
+            f"--user-data-dir={profile_path}", "--no-first-run", "--no-default-browser-check", SITE_URL,
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -447,38 +410,17 @@ def start_chrome(chrome_path: Path, profile_path: Path) -> subprocess.Popen:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Crawl VW parts MSRP values from an Excel OEM list.")
+    parser = argparse.ArgumentParser(description="Crawl GM parts MSRP values from an Excel OEM list.")
     parser.add_argument("--input", required=True, type=Path, help="Input .xlsx or .xlsm workbook.")
-    parser.add_argument(
-        "--column",
-        required=True,
-        help="OEM column header, Excel column letters (for example A), or a 1-based column number.",
-    )
+    parser.add_argument("--column", required=True, help="OEM header, Excel letters, or 1-based column number.")
     parser.add_argument("--output", type=Path, help="Output workbook (default: <input>_results.xlsx).")
     parser.add_argument("--sheet", help="Worksheet name (default: active worksheet).")
     parser.add_argument("--chrome-path", type=Path, help="Path to installed Google Chrome executable.")
     crawl_mode = parser.add_mutually_exclusive_group()
-    crawl_mode.add_argument(
-        "--resume",
-        dest="crawl_mode",
-        action="store_const",
-        const="resume",
-        help="Resume from the existing output workbook (default).",
-    )
-    crawl_mode.add_argument(
-        "--start-over",
-        dest="crawl_mode",
-        action="store_const",
-        const="start-over",
-        help="Ignore existing results and crawl every input OEM again.",
-    )
+    crawl_mode.add_argument("--resume", dest="crawl_mode", action="store_const", const="resume", help="Resume existing results (default).")
+    crawl_mode.add_argument("--start-over", dest="crawl_mode", action="store_const", const="start-over", help="Ignore existing results and crawl all OEMs.")
     parser.set_defaults(crawl_mode="resume")
-    parser.add_argument(
-        "--header-row",
-        type=int,
-        default=1,
-        help="Header row number; use 0 when the input has no header (default: 1).",
-    )
+    parser.add_argument("--header-row", type=int, default=1, help="Header row; use 0 for no header (default: 1).")
     return parser.parse_args()
 
 
@@ -500,7 +442,6 @@ def main() -> int:
     if output_path == input_path:
         print("Input and output paths must be different.", file=sys.stderr)
         return 2
-
     try:
         oem_values = read_oem_values(input_path, args.sheet, args.column, args.header_row)
     except (OSError, ValueError, KeyError) as error:
@@ -517,32 +458,24 @@ def main() -> int:
         except (OSError, ValueError, KeyError) as error:
             print(f"Could not load existing results for resume: {error}", file=sys.stderr)
             return 2
-        if results:
-            print(f"Resuming from {output_path}: loaded {len(results)} previous row(s).")
-
-    results, pending_oems = prepare_crawl_rows(oem_values, results)
-
-    if not pending_oems:
-        print("All input OEM numbers already have completed statuses. Use --start-over to crawl them again.")
+    results, pending = prepare_crawl_rows(oem_values, results)
+    if not pending:
+        print("All input OEM numbers already have successful statuses. Use --start-over to crawl them again.")
         return 0
 
     chrome_path = find_chrome(args.chrome_path)
     if chrome_path is None:
-        if args.chrome_path:
-            print(f"Chrome executable not found: {args.chrome_path}", file=sys.stderr)
-        else:
-            print("Google Chrome was not found. Install Chrome or pass --chrome-path.", file=sys.stderr)
+        print("Google Chrome was not found. Install Chrome or pass --chrome-path.", file=sys.stderr)
         return 2
 
-    print(
-        f"Loaded {len(oem_values)} OEM number(s); {len(pending_oems)} to crawl "
-        f"({args.crawl_mode}). Browser will open for the crawl."
-    )
+    print(f"Loaded {len(oem_values)} OEM number(s); {len(pending)} to crawl ({args.crawl_mode}).")
     profile_path = Path(__file__).resolve().parent / ".chrome-profile"
+    challenge_failures: list[str] = []
     chrome_process = None
-    with sync_playwright() as playwright:
-        chrome_process = start_chrome(chrome_path, profile_path)
-        try:
+    browser = None
+    try:
+        with sync_playwright() as playwright:
+            chrome_process = start_chrome(chrome_path, profile_path)
             browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{CDP_PORT}")
             context = browser.contexts[0] if browser.contexts else browser.new_context()
             pages = context.pages
@@ -558,49 +491,44 @@ def main() -> int:
                 if "challenges.cloudflare.com" in request.url:
                     challenge_failures.append(f"{request.url} ({request.failure or 'request failed'})")
 
-            challenge_failures: list[str] = []
             page.on("requestfailed", record_challenge_failure)
             try:
                 open_site(page, challenge_failures)
             except HumanVerificationError as error:
                 print(f"Crawl stopped: {error}", file=sys.stderr)
                 return 1
-            for index, (row_index, oem_number) in enumerate(pending_oems, start=1):
+
+            for index, (row_index, oem_number) in enumerate(pending, start=1):
                 for attempt in range(1, MAX_CRAWL_ATTEMPTS + 1):
-                    print(
-                        f"[{index}/{len(pending_oems)}] Searching {oem_number!s} "
-                        f"(attempt {attempt}/{MAX_CRAWL_ATTEMPTS})"
-                    )
+                    print(f"[{index}/{len(pending)}] Searching {oem_number!s} (attempt {attempt}/{MAX_CRAWL_ATTEMPTS})")
                     try:
                         msrp, status = crawl_msrp(page, oem_number, challenge_failures)
                     except HumanVerificationError as error:
                         print(f"Crawl stopped: {error}", file=sys.stderr)
                         return 1
                     except Exception as error:
-                        print(f"  Crawl failed for {oem_number!s}: {error}")
-                        msrp = None
-                        status = f"error: {type(error).__name__}: {error}"
-
-                    result_row = (oem_number, msrp, date.today(), status)
-                    results[row_index] = result_row
+                        msrp, status = None, f"error: {type(error).__name__}: {error}"
+                        print(f"  Crawl failed: {status}")
+                    row = (oem_number, msrp, date.today(), status)
+                    results[row_index] = row
                     save_results(output_path, results)
-
                     if status_is_complete(status):
                         break
                     if attempt < MAX_CRAWL_ATTEMPTS:
                         print(f"  Status {status!r} is not successful; retrying shortly.")
                         page.wait_for_timeout(1_500)
-        finally:
+    finally:
+        if browser is not None:
             try:
                 browser.close()
             except Exception:
                 pass
-            if chrome_process.poll() is None:
-                chrome_process.terminate()
-                try:
-                    chrome_process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    chrome_process.kill()
+        if chrome_process is not None and chrome_process.poll() is None:
+            chrome_process.terminate()
+            try:
+                chrome_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                chrome_process.kill()
 
     print(f"Saved {len(results)} row(s) to {output_path}")
     return 0

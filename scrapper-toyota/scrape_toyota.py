@@ -24,8 +24,8 @@ from playwright.sync_api import (
 )
 
 
-SITE_URL = "https://parts.vw.com/"
-SEARCH_INPUT_SELECTOR = "#SearchInput"
+SITE_URL = "https://autoparts.toyota.com/"
+SEARCH_INPUT_SELECTOR = "#searchByKeywordsID"
 CDP_PORT = 9233
 MAX_CRAWL_ATTEMPTS = 3
 OUTPUT_HEADERS = ("OEM Number", "MSRP", "Date", "Status")
@@ -122,11 +122,13 @@ def page_needs_human_verification(page: Page) -> bool:
     return (
         "performing security verification" in body_text
         or "security verification" in body_text
+        or "verify you are human" in body_text
+        or "checking your browser" in body_text
         or "just a moment" in title
     )
 
 
-def is_vw_site_url(url: str) -> bool:
+def is_toyota_site_url(url: str) -> bool:
     return urlparse(url).hostname == urlparse(SITE_URL).hostname
 
 
@@ -135,7 +137,7 @@ def wait_for_human_verification(page: Page, challenge_failures: list[str]) -> No
         return
 
     print(
-        "Cloudflare is asking for human verification. Complete the check in the opened browser; "
+        "The site is asking for human verification. Complete the check in the opened browser; "
         "the crawler will continue automatically.",
         flush=True,
     )
@@ -144,13 +146,12 @@ def wait_for_human_verification(page: Page, challenge_failures: list[str]) -> No
         while page_needs_human_verification(page):
             if challenge_failures:
                 raise HumanVerificationError(
-                    "Cloudflare's verification host failed to load: "
-                    f"{challenge_failures[-1]}. Check DNS, VPN, proxy, or firewall access to "
-                    "brunhild.challenges.cloudflare.com over HTTPS, then rerun the crawler."
+                    "A verification service failed to load: "
+                    f"{challenge_failures[-1]}. Check DNS, VPN, proxy, or firewall access, then rerun the crawler."
                 )
             if time.monotonic() >= deadline:
                 raise HumanVerificationError(
-                    "Cloudflare verification did not clear within five minutes. "
+                    "The verification check did not clear within five minutes. "
                     "The browser remains visible; check network access and try again."
                 )
             page.wait_for_timeout(1_000)
@@ -161,7 +162,7 @@ def wait_for_human_verification(page: Page, challenge_failures: list[str]) -> No
 
 
 def open_site(page: Page, challenge_failures: list[str]) -> None:
-    if not is_vw_site_url(page.url):
+    if not is_toyota_site_url(page.url):
         page.goto(SITE_URL, wait_until="domcontentloaded", timeout=60_000)
     else:
         try:
@@ -173,37 +174,26 @@ def open_site(page: Page, challenge_failures: list[str]) -> None:
         page_description = f"Title: {page.title()!r}; URL: {page.url}; "
         body_excerpt = page.locator("body").inner_text(timeout=15_000).strip().replace("\n", " ")[:300]
         raise RuntimeError(
-            "The VW parts search box was not found after page load. "
+            "The Toyota parts search box was not found after page load. "
             f"{page_description}Page text: {body_excerpt!r}"
         )
 
 
 def find_matching_result(page: Page, oem_number: object) -> Locator | None:
-    expected = normalize_part_number(oem_number)
-    if not expected:
+    if not normalize_part_number(oem_number):
         return None
 
-    links = page.locator("a[href]")
-    ranked_matches: list[tuple[int, int]] = []
+    body_text = page.locator("body").inner_text(timeout=15_000)
+    result_count = re.search(r"\b(\d+)\s+Result\(s\)", body_text, re.IGNORECASE)
+    if result_count is None or int(result_count.group(1)) == 0:
+        return None
+
+    links = page.locator('a[href*="/products/product/"]')
     for index in range(links.count()):
         link = links.nth(index)
-        if not link.is_visible():
-            continue
-        label = link.inner_text().strip()
-        href = link.get_attribute("href") or ""
-        normalized_label = normalize_part_number(label)
-        normalized_href = normalize_part_number(href)
-        if expected == normalized_label:
-            ranked_matches.append((0, index))
-        elif expected in normalized_label:
-            ranked_matches.append((1, index))
-        elif expected in normalized_href:
-            ranked_matches.append((2, index))
-
-    if not ranked_matches:
-        return None
-    ranked_matches.sort()
-    return links.nth(ranked_matches[0][1])
+        if link.is_visible():
+            return link
+    return None
 
 
 def wait_for_matching_result(page: Page, oem_number: object, timeout_seconds: float = 12) -> Locator | None:
@@ -227,28 +217,29 @@ def is_matching_detail_page(page: Page, oem_number: object) -> bool:
         return True
 
     body_text = page.locator("body").inner_text(timeout=15_000)
-    part_number_match = re.search(r"(?im)^Part Number:\s*([^\s]+)", body_text)
+    part_number_match = re.search(r"(?i)Toyota Genuine\s+#?([A-Z0-9-]+)", body_text)
     if part_number_match and normalize_part_number(part_number_match.group(1)) == expected:
         return True
 
-    supersession_match = re.search(r"(?im)^Supersession(?:\(s\))?:\s*(.+)$", body_text)
-    if supersession_match:
-        superseded_numbers = re.split(r"[;,]", supersession_match.group(1))
-        if any(normalize_part_number(number) == expected for number in superseded_numbers):
-            return True
     return False
 
 
 def detail_url_matches_oem(url: str, oem_number: object) -> bool:
     expected = normalize_part_number(oem_number)
     final_path_segment = unquote(urlparse(url).path.rstrip("/").rsplit("/", 1)[-1])
-    return bool(expected and final_path_segment.casefold().endswith(".html") and normalize_part_number(final_path_segment[:-5]) == expected)
+    return bool(
+        expected
+        and "/products/product/" in urlparse(url).path
+        and normalize_part_number(final_path_segment).endswith(expected)
+    )
 
 
 def detail_status(body_text: str, oem_number: object, msrp: float | None) -> str:
     if msrp is None:
         return "msrp_not_found"
-    part_number_match = re.search(r"(?im)^Part Number:\s*([^\s]+)", body_text)
+    part_number_match = re.search(r"(?i)Toyota Genuine\s+#?([A-Z0-9-]+)", body_text)
+    if part_number_match is None:
+        part_number_match = re.search(r"(?im)^#?([A-Z0-9-]+)\s*$", body_text)
     current_part = part_number_match.group(1) if part_number_match else ""
     if current_part and normalize_part_number(current_part) != normalize_part_number(oem_number):
         return f"success_superseded: {current_part}"
@@ -267,18 +258,11 @@ def crawl_msrp(
             search_box = find_search_box(page)
         if search_box is None:
             raise RuntimeError(
-                f"VW search is unavailable on {page.url!r} (page title: {page.title()!r})."
+                f"Toyota search is unavailable on {page.url!r} (page title: {page.title()!r})."
             )
 
     search_box.fill(str(oem_number).strip())
-    submit_button = page.locator("#searchBtn")
-    if submit_button.count() and submit_button.is_visible() and submit_button.is_enabled():
-        try:
-            submit_button.click(timeout=3_000)
-        except PlaywrightTimeoutError:
-            submit_button.evaluate("element => element.click()")
-    else:
-        search_box.press("Enter")
+    search_box.press("Enter")
     try:
         page.wait_for_load_state("domcontentloaded", timeout=20_000)
     except PlaywrightTimeoutError:
@@ -447,7 +431,7 @@ def start_chrome(chrome_path: Path, profile_path: Path) -> subprocess.Popen:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Crawl VW parts MSRP values from an Excel OEM list.")
+    parser = argparse.ArgumentParser(description="Crawl Toyota parts MSRP values from an Excel OEM list.")
     parser.add_argument("--input", required=True, type=Path, help="Input .xlsx or .xlsm workbook.")
     parser.add_argument(
         "--column",
@@ -555,7 +539,7 @@ def main() -> int:
             page.set_default_timeout(30_000)
 
             def record_challenge_failure(request: Request) -> None:
-                if "challenges.cloudflare.com" in request.url:
+                if "challenges.cloudflare.com" in request.url or "awswaf.com" in request.url:
                     challenge_failures.append(f"{request.url} ({request.failure or 'request failed'})")
 
             challenge_failures: list[str] = []
