@@ -59,9 +59,7 @@ def parse_product_msrp(text: str) -> float | None:
     msrp_match = MSRP_PATTERN.search(product_text)
     if msrp_match is None:
         return None
-    sale_match = re.search(r"\$\s*([0-9][0-9,]*(?:\.\d{1,2})?)", product_text[:msrp_match.start()])
-    price_match = sale_match or msrp_match
-    return float(price_match.group(1).replace(",", ""))
+    return float(msrp_match.group(1).replace(",", ""))
 
 
 def resolve_column(sheet, column: str, header_row: int) -> tuple[int, int]:

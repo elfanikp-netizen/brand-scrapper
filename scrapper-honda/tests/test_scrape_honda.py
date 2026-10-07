@@ -42,9 +42,9 @@ class HondaCrawlerTests(unittest.TestCase):
     def test_normalize_part_number(self):
         self.assertEqual(normalize_part_number("17220-R5A-A00"), "17220R5AA00")
 
-    def test_parse_msrp_uses_labelled_price_not_other_amounts(self):
-        self.assertEqual(parse_msrp("$21.76 MSRP: $31.00\nYou Save: $9.24"), 21.76)
-        self.assertEqual(parse_msrp("$23.58\nSave\n$7.42\n23.9% off\nMSRP $31.00"), 23.58)
+    def test_parse_msrp_uses_labelled_original_price_not_discount(self):
+        self.assertEqual(parse_msrp("$21.76 MSRP: $31.00\nYou Save: $9.24"), 31.00)
+        self.assertEqual(parse_msrp("$23.58\nSave\n$7.42\n23.9% off\nMSRP $31.00"), 31.00)
         self.assertEqual(parse_msrp("MSRP $31.00"), 31.00)
         self.assertIsNone(parse_msrp("$21.76 Available from multiple sellers"))
 

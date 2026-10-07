@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>VoiceTyping Debug Logs</title>
+  <style>
+    body {
+      font-family: monospace;
+      padding: 10px;
+      margin: 0;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      box-sizing: border-box;
+    }
+    #controls {
+      padding: 10px;
+      background: #f0f0f0;
+      border-bottom: 1px solid #ccc;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    .filter-group,
+    .config-group {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }
+    #routing-key-input,
+    #oauth-token-input {
+      font-family: monospace;
+      font-size: 12px;
+      padding: 3px 6px;
+    }
+    #log-container {
+      flex: 1;
+      overflow-y: auto;
+      border: 1px solid #ccc;
+      background: #fff;
+      white-space: pre-wrap;
+      padding: 5px;
+      margin-top: 10px;
+    }
+    .log-entry {
+      border-bottom: 1px solid #eee;
+      padding: 2px 0;
+      font-size: 12px;
+    }
+    .log-module {
+      font-weight: bold;
+      margin-right: 5px;
+    }
+    .log-timestamp {
+      color: #666;
+      margin-right: 5px;
+    }
+    /* Module specific colors */
+    .module-background { color: #06c; }
+    .module-offscreen { color: #093; }
+    .module-browser { color: #c00; }
+    .module-debug { color: #609; }
+    .module-system { color: #5f6368; }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <header id="controls">
+    <div class="filter-group">
+      <span>Filter:</span>
+      <label><input type="checkbox" id="filter-background" checked> Background</label>
+      <label><input type="checkbox" id="filter-offscreen" checked> Offscreen</label>
+      <label><input type="checkbox" id="filter-browser" checked> Browser</label>
+    </div>
+    <div class="config-group">
+      <label for="routing-key-input">Use Beyond Routing Key:</label>
+      <input type="text" id="routing-key-input">
+    </div>
+    <div class="config-group">
+      <label for="oauth-token-input">Use OAuth Token:</label>
+      <input type="text" id="oauth-token-input">
+    </div>
+    <button id="export-btn" type="button">Export Logs</button>
+  </header>
+  <div id="log-container"></div>
+  <script type="module" src="debug_compiled.js"></script>
+</body>
+</html>

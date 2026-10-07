@@ -86,7 +86,7 @@ class KiaCrawlerTests(unittest.TestCase):
     def test_parse_msrp_with_currency_and_thousands_separator(self):
         self.assertEqual(parse_msrp("Kia 0K2A1-09-000\nMSRP: $1,030.06"), 1030.06)
 
-    def test_parse_product_price_prefers_discounted_price(self):
+    def test_parse_product_price_uses_original_msrp_not_discount(self):
         text = """Kia 0K2A1-09-000 Air Cleaner Filter
 Part Description
 Filter-Air Cleaner
@@ -95,7 +95,7 @@ You Save: $6.80 (23%)
 Related Parts
 Kia 0K2A1-09-001
 MSRP $999.99"""
-        self.assertEqual(parse_product_msrp(text), 23.26)
+        self.assertEqual(parse_product_msrp(text), 30.06)
 
     def test_parse_product_price_falls_back_to_msrp_without_sale_price(self):
         self.assertEqual(parse_product_msrp("Kia 0K2A1-09-000 Air Cleaner\nMSRP $30.06"), 30.06)

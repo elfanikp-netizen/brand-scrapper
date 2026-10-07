@@ -21,12 +21,11 @@ python scrape_hyundai.py --input .\parts.xlsx --column B --output .\hyundai-pric
 
 Row 1 is treated as the header by default. Use `--header-row 0` for a headerless sheet or `--sheet "Sheet1"` to select a worksheet. The default output is `<input>_results.xlsx` with `OEM Number`, `MSRP`, `Date`, and `Status` columns. Duplicate OEMs are retained as separate rows, and the workbook is saved after each part.
 
-The crawler resumes from an existing output by default. Successful rows (`success` or `success_superseded: ...`) are skipped. By default, it only opens an exact matching product suggestion; if none appears, it saves `not_found` and moves to the next OEM without submitting a full search. Add `--attempt-on-search` to submit the full search as a fallback and retry unsuccessful results up to three times. Use `--start-over` to recrawl every input row:
+The crawler resumes from an existing output by default. Successful rows (`success` or `success_superseded: ...`) are skipped. It submits each OEM once; if the search does not reach a matching detail page, the crawler closes any popup and continues with the next value. Use `--start-over` to recrawl every input row:
 
 ```powershell
 python scrape_hyundai.py --input .\parts.xlsx --column "OEM Number" --resume
 python scrape_hyundai.py --input .\parts.xlsx --column "OEM Number" --start-over
-python scrape_hyundai.py --input .\parts.xlsx --column "OEM Number" --attempt-on-search
 ```
 
 HyundaiPartsDeal's header search opens the product detail directly for an exact OEM match. If full search opens a results page, the crawler selects the result that matches the requested OEM.

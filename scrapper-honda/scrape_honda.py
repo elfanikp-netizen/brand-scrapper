@@ -50,11 +50,7 @@ def parse_msrp(text: str) -> float | None:
     msrp_match = re.search(r"\bMSRP\b\s*[:\-]?\s*" + price_pattern, text, re.IGNORECASE)
     if msrp_match is None:
         return None
-
-    # The OEM Parts Online product page lists its discounted price before the MSRP.
-    sale_match = re.search(price_pattern, text[: msrp_match.start()], re.IGNORECASE)
-    price_match = sale_match or msrp_match
-    return float(price_match.group(1).replace(",", ""))
+    return float(msrp_match.group(1).replace(",", ""))
 
 
 def resolve_column(sheet, column: str, header_row: int) -> tuple[int, int]:

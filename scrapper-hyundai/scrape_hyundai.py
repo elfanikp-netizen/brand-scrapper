@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -26,8 +27,8 @@ from playwright.sync_api import (
 
 SITE_URL = "https://www.hyundaipartsdeal.com/"
 SEARCH_INPUT_SELECTOR = 'input[placeholder="Search by Part Number, Part Name, or Vehicle"]'
+SEARCH_BUTTON_SELECTOR = 'button[aria-label="Search by Part Number, Part Name, or Vehicle"]'
 CDP_PORT = 9236
-MAX_CRAWL_ATTEMPTS = 3
 OUTPUT_HEADERS = ("OEM Number", "MSRP", "Date", "Status")
 MSRP_PATTERN = re.compile(
     r"\bMSRP\b\s*(?:\([^)]*\))?\s*:?\s*\$?\s*([0-9][0-9,]*(?:\.\d{1,2})?)",
@@ -58,9 +59,7 @@ def parse_product_msrp(text: str) -> float | None:
     msrp_match = MSRP_PATTERN.search(product_text)
     if msrp_match is None:
         return None
-    sale_match = re.search(r"\$\s*([0-9][0-9,]*(?:\.\d{1,2})?)", product_text[:msrp_match.start()])
-    price_match = sale_match or msrp_match
-    return float(price_match.group(1).replace(",", ""))
+    return float(msrp_match.group(1).replace(",", ""))
 
 
 def resolve_column(sheet, column: str, header_row: int) -> tuple[int, int]:
@@ -113,6 +112,13 @@ def find_search_box(page: Page) -> Locator | None:
     search_box = page.locator(SEARCH_INPUT_SELECTOR)
     if search_box.count() and search_box.is_visible() and search_box.is_enabled():
         return search_box
+    return None
+
+
+def find_search_button(page: Page) -> Locator | None:
+    search_button = page.locator(SEARCH_BUTTON_SELECTOR)
+    if search_button.count() and search_button.is_visible() and search_button.is_enabled():
+        return search_button
     return None
 
 
@@ -329,7 +335,6 @@ def crawl_msrp(
     page: Page,
     oem_number: object,
     challenge_failures: list[str],
-    attempt_on_search: bool = False,
 ) -> tuple[float | None, str]:
     dismiss_blocking_popups(page)
     search_box = find_search_box(page)
@@ -343,28 +348,23 @@ def crawl_msrp(
             )
 
     search_box.fill(str(oem_number).strip())
-    suggestion_link = wait_for_product_suggestion(page, oem_number)
-    if suggestion_link is not None:
-        try:
-            suggestion_link.click(timeout=10_000)
-        except PlaywrightTimeoutError:
-            print(f"  Product suggestion for {oem_number!s} could not be clicked.")
-            return None, f"error: suggestion click timed out for {oem_number!s}"
-    else:
-        if not attempt_on_search:
-            print(f"  No matching product suggestion appeared for {oem_number!s}; full search is disabled.")
-            return None, "not_found"
-        starting_url = page.url
-        search_box.press("Enter")
-        try:
-            page.wait_for_url(
-                lambda url: url != starting_url,
-                wait_until="domcontentloaded",
-                timeout=20_000,
-            )
-        except PlaywrightTimeoutError:
-            pass
-        wait_for_human_verification(page, challenge_failures)
+
+    print("  Entering the OEM and submitting the search.", flush=True)
+    starting_url = page.url
+    search_box.press("Enter")
+    try:
+        page.wait_for_url(
+            lambda url: url != starting_url,
+            wait_until="domcontentloaded",
+            timeout=20_000,
+        )
+    except PlaywrightTimeoutError:
+        search_button = find_search_button(page)
+        if search_button is not None:
+            print("  Enter did not navigate; clicking the search button.", flush=True)
+            search_button.click(timeout=10_000)
+    print("  Search submitted; checking the product page and results.", flush=True)
+    wait_for_human_verification(page, challenge_failures)
 
     if not is_product_detail_page(page):
         result_link = wait_for_matching_result(page, oem_number)
@@ -461,12 +461,6 @@ def status_is_complete(status: str) -> bool:
     return bool(replacement_match and re.search(r"\d", replacement_match.group(1)))
 
 
-def should_retry_crawl(status: str, attempt_on_search: bool = False) -> bool:
-    if status_is_complete(status):
-        return False
-    return not (status == "not_found" and not attempt_on_search)
-
-
 def prepare_crawl_rows(
     oem_values: list[object],
     previous_results: list[tuple[object, float | None, date, str]],
@@ -513,6 +507,24 @@ def cdp_is_ready() -> bool:
         return False
 
 
+def cdp_page_is_hyundai() -> bool:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{CDP_PORT}/json/list", timeout=2) as response:
+            pages = json.loads(response.read().decode("utf-8"))
+    except (Exception, ValueError):
+        return False
+
+    for page in pages:
+        url = str(page.get("url") or "")
+        if is_hyundai_site_url(url):
+            return True
+    return False
+
+
+def should_start_chrome() -> bool:
+    return not (cdp_is_ready() and cdp_page_is_hyundai())
+
+
 def start_chrome(chrome_path: Path, profile_path: Path) -> subprocess.Popen:
     profile_path.mkdir(parents=True, exist_ok=True)
     process = subprocess.Popen(
@@ -528,13 +540,14 @@ def start_chrome(chrome_path: Path, profile_path: Path) -> subprocess.Popen:
         stderr=subprocess.DEVNULL,
     )
     for _ in range(60):
-        if cdp_is_ready():
+        if cdp_is_ready() and cdp_page_is_hyundai():
             return process
         if process.poll() is not None:
             raise RuntimeError(f"Chrome exited during startup with code {process.returncode}.")
         time.sleep(0.5)
     process.terminate()
-    raise RuntimeError(f"Chrome started but DevTools did not open on port {CDP_PORT}.")
+    process.wait(timeout=5)
+    raise RuntimeError(f"Chrome started but the Hyundai page was not available on port {CDP_PORT}.")
 
 
 def parse_args() -> argparse.Namespace:
@@ -548,11 +561,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, help="Output workbook (default: <input>_results.xlsx).")
     parser.add_argument("--sheet", help="Worksheet name (default: active worksheet).")
     parser.add_argument("--chrome-path", type=Path, help="Path to installed Google Chrome executable.")
-    parser.add_argument(
-        "--attempt-on-search",
-        action="store_true",
-        help="Submit a full search and retry if no matching product suggestion appears (default: disabled).",
-    )
     crawl_mode = parser.add_mutually_exclusive_group()
     crawl_mode.add_argument(
         "--resume",
@@ -638,7 +646,26 @@ def main() -> int:
     chrome_process = None
     browser = None
     with sync_playwright() as playwright:
-        chrome_process = start_chrome(chrome_path, profile_path)
+        if should_start_chrome():
+            if cdp_is_ready():
+                print("Found a stale browser session on the Hyundai CDP port; opening a fresh browser.", flush=True)
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{CDP_PORT}/json/list", timeout=2) as response:
+                        targets = json.loads(response.read().decode("utf-8"))
+                    for target in targets:
+                        target_id = target.get("id")
+                        if target_id:
+                            try:
+                                urllib.request.urlopen(
+                                    f"http://127.0.0.1:{CDP_PORT}/json/close/{target_id}",
+                                    timeout=2,
+                                )
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                time.sleep(0.5)
+            chrome_process = start_chrome(chrome_path, profile_path)
         try:
             browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{CDP_PORT}")
             context = browser.contexts[0] if browser.contexts else browser.new_context()
@@ -663,35 +690,30 @@ def main() -> int:
                 print(f"Crawl stopped: {error}", file=sys.stderr)
                 return 1
             for index, (row_index, oem_number) in enumerate(pending_oems, start=1):
-                for attempt in range(1, MAX_CRAWL_ATTEMPTS + 1):
-                    print(
-                        f"[{index}/{len(pending_oems)}] Searching {oem_number!s} "
-                        f"(attempt {attempt}/{MAX_CRAWL_ATTEMPTS})"
+                print(f"[{index}/{len(pending_oems)}] Searching {oem_number!s}")
+                try:
+                    msrp, status = crawl_msrp(
+                        page,
+                        oem_number,
+                        challenge_failures,
                     )
-                    try:
-                        msrp, status = crawl_msrp(
-                            page,
-                            oem_number,
-                            challenge_failures,
-                            attempt_on_search=args.attempt_on_search,
-                        )
-                    except HumanVerificationError as error:
-                        print(f"Crawl stopped: {error}", file=sys.stderr)
-                        return 1
-                    except Exception as error:
-                        print(f"  Crawl failed for {oem_number!s}: {error}")
-                        msrp = None
-                        status = f"error: {type(error).__name__}: {error}"
+                except HumanVerificationError as error:
+                    print(f"Crawl stopped: {error}", file=sys.stderr)
+                    return 1
+                except Exception as error:
+                    print(f"  Crawl failed for {oem_number!s}: {error}")
+                    msrp = None
+                    status = f"error: {type(error).__name__}: {error}"
 
-                    result_row = (oem_number, msrp, date.today(), status)
-                    results[row_index] = result_row
-                    save_results(output_path, results)
-
-                    if not should_retry_crawl(status, args.attempt_on_search):
-                        break
-                    if attempt < MAX_CRAWL_ATTEMPTS:
-                        print(f"  Status {status!r} is not successful; retrying shortly.")
-                        page.wait_for_timeout(1_500)
+                result_row = (oem_number, msrp, date.today(), status)
+                results[row_index] = result_row
+                save_results(output_path, results)
+                dismiss_blocking_popups(page)
+                if status_is_complete(status):
+                    continue
+                if status == "not_found":
+                    continue
+                print(f"  Status {status!r} is not successful; continuing to the next search.")
         finally:
             if browser is not None:
                 try:

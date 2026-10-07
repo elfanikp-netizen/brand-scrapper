@@ -1,0 +1,29 @@
+{
+  "name": "VoiceTyping Connector Extension",
+  "manifest_version": 3,
+  "version": "20260928.1",
+  "version_name": "1.0 20260928.1",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAr62wWrkoTooSMcorrAyU6Tf+Jl8l581i1yejhywRgw83NEhNBFQ5cHxF8G9RHNpBLWzSRCKAAh9gqvIb+k1xjHTYbvsX2SwM0TZGbchVVCsTvltPYXcNMcrhmsAfUowyUK0YcLgX8davTOMZAHlfOro5fYTdrb5qa4ht+LYwEdnFRiaDNcBAKfp730mFOjctn8Nkbhd9HBZIp/TJiOvByQRGAlxZN/88kHjz0H1pez1a7kQbu6ngwqSPL30BPySVO7XDrpu7Kz6Cbx0xUxLjD3sZXFlcwVkOEkRtGfs5Da4UA0Uj4aL5ict5qqIUArhY0luEdkWnTk7QTRNEaY80OwIDAQAB",
+  "description": "Connector extension for VoiceTyping",
+  "background": {
+    "service_worker": "background_compiled.js",
+    "type": "module"
+  },
+  "oauth2": {
+    "auto_approve": true,
+    "scopes": [
+      "https://www.googleapis.com/auth/temporary"
+    ]
+  },
+  "permissions": [
+    "audioCapture",
+    "dictationPrivate",
+    "downloads",
+    "identity",
+    "offscreen",
+    "storage",
+    "systemPrivate"
+  ],
+  "incognito": "not_allowed",
+  "message_serialization": "structured_clone"
+}

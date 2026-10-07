@@ -5,8 +5,10 @@ from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
 from openpyxl import Workbook, load_workbook
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from scrape_hyundai import (
+    cdp_page_is_hyundai,
     crawl_msrp,
     detail_status,
     detail_url_matches_oem,
@@ -20,38 +22,60 @@ from scrape_hyundai import (
     read_oem_values,
     resolve_column,
     save_results,
-    should_retry_crawl,
+    should_start_chrome,
     status_is_complete,
     wait_for_human_verification,
 )
 
 
 class HyundaiCrawlerTests(unittest.TestCase):
-    def test_attempt_on_search_is_disabled_by_default_and_flag_enables_it(self):
+    def test_parse_args_supports_basic_crawl_options(self):
         with patch("sys.argv", ["scrape_hyundai.py", "--input", "parts.xlsx", "--column", "A"]):
-            self.assertFalse(parse_args().attempt_on_search)
-        with patch(
-            "sys.argv",
-            ["scrape_hyundai.py", "--input", "parts.xlsx", "--column", "A", "--attempt-on-search"],
-        ):
-            self.assertTrue(parse_args().attempt_on_search)
+            args = parse_args()
+        self.assertEqual(args.input, Path("parts.xlsx"))
+        self.assertEqual(args.column, "A")
 
-    def test_missing_suggestion_does_not_submit_search_by_default(self):
+    def test_missing_suggestion_submits_search_once(self):
         page = Mock()
         search_box = Mock()
+        page.title.return_value = "Hyundai Parts"
+        page.url = "https://www.hyundaipartsdeal.com/"
+        page.locator.return_value.inner_text.return_value = "Hyundai Parts"
         with (
             patch("scrape_hyundai.dismiss_blocking_popups"),
             patch("scrape_hyundai.find_search_box", return_value=search_box),
-            patch("scrape_hyundai.wait_for_product_suggestion", return_value=None),
+            patch("scrape_hyundai.wait_for_matching_result", return_value=None),
+            patch("scrape_hyundai.page_needs_human_verification", return_value=False),
         ):
             result = crawl_msrp(page, "28113-2W100", [])
         self.assertEqual(result, (None, "not_found"))
-        search_box.press.assert_not_called()
+        search_box.fill.assert_called_once_with("28113-2W100")
+        self.assertEqual(search_box.press.call_count, 1)
 
-    def test_not_found_retry_is_opt_in(self):
-        self.assertFalse(should_retry_crawl("not_found"))
-        self.assertTrue(should_retry_crawl("not_found", attempt_on_search=True))
-        self.assertFalse(should_retry_crawl("success", attempt_on_search=True))
+    def test_search_uses_enter_then_clicks_button_when_needed(self):
+        page = Mock()
+        search_box = Mock()
+        search_button = Mock()
+        page.title.return_value = "Hyundai Parts"
+        page.url = "https://www.hyundaipartsdeal.com/"
+        page.locator.return_value.inner_text.return_value = "Hyundai Parts"
+        page.wait_for_url.side_effect = PlaywrightTimeoutError("no navigation")
+        with (
+            patch("scrape_hyundai.dismiss_blocking_popups"),
+            patch("scrape_hyundai.find_search_box", return_value=search_box),
+            patch("scrape_hyundai.find_search_button", return_value=search_button),
+            patch("scrape_hyundai.is_product_detail_page", return_value=True),
+            patch("scrape_hyundai.wait_for_product_detail", return_value=True),
+            patch("scrape_hyundai.is_matching_detail_page", return_value=True),
+            patch("scrape_hyundai.wait_for_product_msrp", return_value="Hyundai 28113-2W100\nMSRP: $30.06"),
+            patch("scrape_hyundai.parse_product_msrp", return_value=30.06),
+            patch("scrape_hyundai.detail_status", return_value="success"),
+        ):
+            result = crawl_msrp(page, "28113-2W100", [])
+        self.assertEqual(result, (30.06, "success"))
+        search_box.fill.assert_called_once_with("28113-2W100")
+        search_box.press.assert_called_once_with("Enter")
+        search_button.click.assert_called_once_with(timeout=10_000)
 
     def test_verification_waits_for_manual_completion_after_request_failure(self):
         page = Mock()
@@ -79,7 +103,7 @@ You Save: $6.80 (23%)
 Related Parts
 Hyundai 28110-B8100
 MSRP $999.99"""
-        self.assertEqual(parse_product_msrp(text), 23.26)
+        self.assertEqual(parse_product_msrp(text), 30.06)
 
     def test_parse_product_msrp_falls_back_to_list_price_without_discount(self):
         self.assertEqual(parse_product_msrp("Hyundai 28113-2W100 Air Cleaner\nMSRP $30.06"), 30.06)
@@ -110,6 +134,26 @@ MSRP $999.99"""
         )
         self.assertFalse(is_hyundai_site_url("about:blank"))
 
+    def test_cdp_page_rejects_stale_non_hyundai_session(self):
+        response = Mock()
+        response.read.return_value = b'[{"url": "https://www.kiapartsnow.com/"}]'
+        with patch("scrape_hyundai.urllib.request.urlopen", return_value=response):
+            self.assertFalse(cdp_page_is_hyundai())
+
+    def test_should_start_chrome_reuses_existing_hyundai_browser(self):
+        with (
+            patch("scrape_hyundai.cdp_is_ready", return_value=True),
+            patch("scrape_hyundai.cdp_page_is_hyundai", return_value=True),
+        ):
+            self.assertFalse(should_start_chrome())
+
+    def test_should_start_chrome_starts_new_browser_for_stale_or_non_hyundai_session(self):
+        with (
+            patch("scrape_hyundai.cdp_is_ready", return_value=True),
+            patch("scrape_hyundai.cdp_page_is_hyundai", return_value=False),
+        ):
+            self.assertTrue(should_start_chrome())
+
     def test_status_reports_superseded_hyundai_part(self):
         self.assertEqual(
             detail_status("Hyundai 28113-2W101 Air Cleaner Filter", "28113-2W100", 30.06),
@@ -124,7 +168,6 @@ MSRP $999.99"""
         self.assertFalse(status_is_complete("not_found"))
         self.assertFalse(status_is_complete("msrp_not_found"))
         self.assertFalse(status_is_complete("error: TimeoutError"))
-        self.assertFalse(should_retry_crawl("success"))
 
     def test_resolve_column_supports_header_and_excel_letter(self):
         workbook = Workbook()
