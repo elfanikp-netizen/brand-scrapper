@@ -27,7 +27,6 @@ from playwright.sync_api import (
 SITE_URL = "https://parts.vw.com/"
 SEARCH_INPUT_SELECTOR = "#SearchInput"
 CDP_PORT = 9233
-MAX_CRAWL_ATTEMPTS = 3
 OUTPUT_HEADERS = ("OEM Number", "MSRP", "Date", "Status")
 MSRP_PATTERN = re.compile(
     r"\bMSRP\b\s*(?:\([^)]*\))?\s*:?\s*\$?\s*([0-9][0-9,]*(?:\.\d{1,2})?)",
@@ -540,6 +539,8 @@ def main() -> int:
     )
     profile_path = Path(__file__).resolve().parent / ".chrome-profile"
     chrome_process = None
+    browser = None
+    keep_browser_open = False
     with sync_playwright() as playwright:
         chrome_process = start_chrome(chrome_path, profile_path)
         try:
@@ -563,39 +564,32 @@ def main() -> int:
             try:
                 open_site(page, challenge_failures)
             except HumanVerificationError as error:
-                print(f"Crawl stopped: {error}", file=sys.stderr)
+                keep_browser_open = True
+                print(f"Crawl stopped: {error} Browser left open for verification.", file=sys.stderr)
                 return 1
             for index, (row_index, oem_number) in enumerate(pending_oems, start=1):
-                for attempt in range(1, MAX_CRAWL_ATTEMPTS + 1):
-                    print(
-                        f"[{index}/{len(pending_oems)}] Searching {oem_number!s} "
-                        f"(attempt {attempt}/{MAX_CRAWL_ATTEMPTS})"
-                    )
-                    try:
-                        msrp, status = crawl_msrp(page, oem_number, challenge_failures)
-                    except HumanVerificationError as error:
-                        print(f"Crawl stopped: {error}", file=sys.stderr)
-                        return 1
-                    except Exception as error:
-                        print(f"  Crawl failed for {oem_number!s}: {error}")
-                        msrp = None
-                        status = f"error: {type(error).__name__}: {error}"
+                print(f"[{index}/{len(pending_oems)}] Searching {oem_number!s}")
+                try:
+                    msrp, status = crawl_msrp(page, oem_number, challenge_failures)
+                except HumanVerificationError as error:
+                    keep_browser_open = True
+                    print(f"Crawl stopped: {error} Browser left open for verification.", file=sys.stderr)
+                    return 1
+                except Exception as error:
+                    print(f"  Crawl failed for {oem_number!s}: {error}")
+                    msrp = None
+                    status = f"error: {type(error).__name__}: {error}"
 
-                    result_row = (oem_number, msrp, date.today(), status)
-                    results[row_index] = result_row
-                    save_results(output_path, results)
-
-                    if status_is_complete(status):
-                        break
-                    if attempt < MAX_CRAWL_ATTEMPTS:
-                        print(f"  Status {status!r} is not successful; retrying shortly.")
-                        page.wait_for_timeout(1_500)
+                result_row = (oem_number, msrp, date.today(), status)
+                results[row_index] = result_row
+                save_results(output_path, results)
         finally:
-            try:
-                browser.close()
-            except Exception:
-                pass
-            if chrome_process.poll() is None:
+            if browser is not None and not keep_browser_open:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+            if not keep_browser_open and chrome_process.poll() is None:
                 chrome_process.terminate()
                 try:
                     chrome_process.wait(timeout=5)

@@ -20,43 +20,21 @@ from scrape_kia import (
     read_oem_values,
     resolve_column,
     save_results,
-    should_retry_crawl,
     status_is_complete,
     wait_for_human_verification,
 )
 
 
 class KiaCrawlerTests(unittest.TestCase):
-    def test_full_search_is_enabled_by_default_and_can_be_disabled(self):
+    def test_attempt_on_search_option_is_removed(self):
         with patch("sys.argv", ["scrape_kia.py", "--input", "parts.xlsx", "--column", "A"]):
-            self.assertTrue(parse_args().attempt_on_search)
-        with patch(
-            "sys.argv",
-            ["scrape_kia.py", "--input", "parts.xlsx", "--column", "A", "--attempt-on-search"],
-        ):
-            self.assertTrue(parse_args().attempt_on_search)
-        with patch(
-            "sys.argv",
-            ["scrape_kia.py", "--input", "parts.xlsx", "--column", "A", "--no-attempt-on-search"],
-        ):
-            self.assertFalse(parse_args().attempt_on_search)
+            args = parse_args()
+        self.assertFalse(hasattr(args, "attempt_on_search"))
 
-    def test_missing_suggestion_does_not_submit_search_when_opted_out(self):
+    def test_missing_suggestion_submits_full_search_once(self):
         page = Mock()
         search_box = Mock()
-        with (
-            patch("scrape_kia.dismiss_blocking_popups"),
-            patch("scrape_kia.find_search_box", return_value=search_box),
-            patch("scrape_kia.wait_for_product_suggestion", return_value=None),
-        ):
-            result = crawl_msrp(page, "0K2A1-09-000", [], attempt_on_search=False)
-        self.assertEqual(result, (None, "not_found"))
-        search_box.press.assert_not_called()
-
-    def test_full_search_and_not_found_retry_when_enabled(self):
-        page = Mock()
         page.url = "https://www.kiapartsnow.com/"
-        search_box = Mock()
         with (
             patch("scrape_kia.dismiss_blocking_popups"),
             patch("scrape_kia.find_search_box", return_value=search_box),
@@ -65,12 +43,9 @@ class KiaCrawlerTests(unittest.TestCase):
             patch("scrape_kia.is_product_detail_page", return_value=False),
             patch("scrape_kia.wait_for_matching_result", return_value=None),
         ):
-            result = crawl_msrp(page, "0K2A1-09-000", [], attempt_on_search=True)
+            result = crawl_msrp(page, "0K2A1-09-000", [])
         self.assertEqual(result, (None, "not_found"))
         search_box.press.assert_called_once_with("Enter")
-        self.assertFalse(should_retry_crawl("not_found", attempt_on_search=False))
-        self.assertTrue(should_retry_crawl("not_found", attempt_on_search=True))
-        self.assertFalse(should_retry_crawl("success", attempt_on_search=True))
 
     def test_verification_waits_for_manual_completion_after_request_failure(self):
         page = Mock()

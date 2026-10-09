@@ -21,13 +21,11 @@ python scrape_kia.py --input .\parts.xlsx --column B --output .\kia-prices.xlsx
 
 Row 1 is treated as the header by default. Use `--header-row 0` for a headerless sheet or `--sheet "Sheet1"` to select a worksheet. The default output is `<input>_results.xlsx` with `OEM Number`, `MSRP`, `Date`, and `Status` columns. Duplicate OEMs are retained as separate rows, and the workbook is saved after each part.
 
-The crawler resumes from an existing output by default. Successful rows (`success` or `success_superseded: ...`) are skipped. It clicks an exact matching product suggestion when available; otherwise it submits the full search and retries unsuccessful results up to three times. Use `--no-attempt-on-search` to disable full-search fallback and skip OEMs with no matching suggestion. Use `--start-over` to recrawl every input row:
+The crawler resumes from an existing output by default. Successful rows (`success` or `success_superseded: ...`) are skipped. It clicks an exact matching product suggestion when available; otherwise it submits one full search. Each OEM is processed once per run. Use `--start-over` to recrawl every input row:
 
 ```powershell
 python scrape_kia.py --input .\parts.xlsx --column "OEM Number" --resume
 python scrape_kia.py --input .\parts.xlsx --column "OEM Number" --start-over
-python scrape_kia.py --input .\parts.xlsx --column "OEM Number" --attempt-on-search
-python scrape_kia.py --input .\parts.xlsx --column "OEM Number" --no-attempt-on-search
 ```
 
 If full search opens a results page, the crawler selects the result that matches the requested OEM.

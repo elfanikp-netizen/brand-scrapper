@@ -21,7 +21,7 @@ python scrape_vw.py --input .\parts.xlsx --column B --output .\vw-prices.xlsx
 
 By default, row 1 is treated as the header. For a sheet with no header, pass `--header-row 0`. Choose a worksheet with `--sheet "Sheet1"`. The default output is `<input>_results.xlsx` and contains `OEM Number`, `MSRP`, `Date`, and `Status` columns. Duplicate OEMs in the input are crawled for each row and saved as separate output rows. The workbook is saved after every part so completed rows remain available if the crawl is interrupted.
 
-The crawler resumes by default when the output workbook already exists. It skips only successful input-row occurrences (`success` or `success_superseded: ...`); unsuccessful rows are retried on resume. Duplicate OEM occurrences are matched by their occurrence order, so a successful first duplicate does not cause later duplicate input rows to be skipped. Each row gets up to three attempts in a run. Use `--resume` to make resume behavior explicit, or `--start-over` to ignore existing results and crawl all input rows again:
+The crawler resumes by default when the output workbook already exists. It skips only successful input-row occurrences (`success` or `success_superseded: ...`); unsuccessful rows are eligible again on a later resume run. Duplicate OEM occurrences are matched by their occurrence order, so a successful first duplicate does not cause later duplicate input rows to be skipped. Each row is searched once per run. Use `--resume` to make resume behavior explicit, or `--start-over` to ignore existing results and crawl all input rows again:
 
 ```powershell
 python scrape_vw.py --input .\parts.xlsx --column "OEM Number" --resume
