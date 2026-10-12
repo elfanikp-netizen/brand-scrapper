@@ -27,7 +27,6 @@ from playwright.sync_api import (
 
 SITE_URL = "https://www.audipartsgiant.com/"
 SEARCH_INPUT_SELECTOR = 'input[placeholder="Search by Part Number, Part Name, or Vehicle"]'
-SEARCH_BUTTON_SELECTOR = 'button[aria-label="Search by Part Number, Part Name, or Vehicle"]'
 CDP_PORT = 9240
 OUTPUT_HEADERS = ("OEM Number", "MSRP", "Date", "Status")
 MSRP_PATTERN = re.compile(
@@ -114,13 +113,6 @@ def find_search_box(page: Page) -> Locator | None:
     return None
 
 
-def find_search_button(page: Page) -> Locator | None:
-    button = page.locator(SEARCH_BUTTON_SELECTOR)
-    if button.count() and button.is_visible() and button.is_enabled():
-        return button
-    return None
-
-
 def dismiss_blocking_popups(page: Page) -> None:
     close_buttons = page.locator(
         'button[aria-label*="close" i], button[title*="close" i], '
@@ -146,6 +138,21 @@ def dismiss_blocking_popups(page: Page) -> None:
         page.keyboard.press("Escape")
     except PlaywrightError:
         pass
+
+
+def has_vehicle_selection_popup(page: Page) -> bool:
+    popup_candidates = page.locator('.v-cm, .v-cm-wrap, [role="dialog"]')
+    for index in range(popup_candidates.count()):
+        popup = popup_candidates.nth(index)
+        try:
+            if not popup.is_visible():
+                continue
+            text = popup.inner_text(timeout=1_000).casefold()
+        except PlaywrightError:
+            continue
+        if "select vehicle" in text or "enter the vin" in text:
+            return True
+    return False
 
 
 def page_needs_human_verification(page: Page) -> bool:
@@ -328,31 +335,21 @@ def crawl_msrp(page: Page, oem_number: object, challenge_failures: list[str]) ->
         page.wait_for_url(
             lambda current_url: current_url != starting_url,
             wait_until="domcontentloaded",
-            timeout=30_000,
+            timeout=3_000,
         )
-    except PlaywrightTimeoutError:
-        button = find_search_button(page)
-        if button is not None:
-            button.click(timeout=10_000)
-            try:
-                page.wait_for_url(
-                    lambda current_url: current_url != starting_url,
-                    wait_until="domcontentloaded",
-                    timeout=15_000,
-                )
-            except PlaywrightTimeoutError:
-                pass
-    try:
-        page.wait_for_load_state("domcontentloaded", timeout=10_000)
     except PlaywrightTimeoutError:
         pass
     wait_for_human_verification(page, challenge_failures)
+    if has_vehicle_selection_popup(page):
+        print(f"  Vehicle selection appeared for {oem_number!s}; skipping to the next OEM.")
+        dismiss_blocking_popups(page)
+        return None, "not_found"
     dismiss_blocking_popups(page)
 
     if not is_product_detail_page(page):
-        result = wait_for_matching_result(page, oem_number)
+        result = find_matching_result(page, oem_number)
         if result is None:
-            print(f"  No Audi product result matched OEM {oem_number!s}.")
+            print(f"  Search did not open an Audi detail page or matching result for {oem_number!s}; moving on.")
             return None, "not_found"
         href = result.get_attribute("href")
         if not href:

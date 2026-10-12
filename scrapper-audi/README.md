@@ -28,7 +28,7 @@ python scrape_audi.py --input .\parts.xlsx --column "OEM Number" --resume
 python scrape_audi.py --input .\parts.xlsx --column "OEM Number" --start-over
 ```
 
-The crawler closes available popups, submits each part number through AudiPartsGiant's header search, and accepts direct `/genuine/` product pages or matching product links from search results. MSRP is read from the product price area, including unavailable products.
+The crawler closes available popups, submits each part number through AudiPartsGiant's header search, and accepts direct `/genuine/` product pages or matching product links from search results. If search does not navigate to a detail page, no matching result appears, or a vehicle-selection popup opens, that OEM is marked `not_found` and the crawler immediately moves to the next one. MSRP is read from the product price area, including unavailable products.
 
 Statuses are `success`, `success_superseded: <current OEM>`, `not_found`, `msrp_not_found`, or `error: ...`. Older result workbooks without a Status column can be resumed; rows with an MSRP are treated as successful.
 

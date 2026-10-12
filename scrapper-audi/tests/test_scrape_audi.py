@@ -84,21 +84,39 @@ Ships in 1-2 Business Days"""
         self.assertFalse(status_is_complete("not_found"))
         self.assertFalse(status_is_complete("msrp_not_found"))
 
-    def test_missing_result_returns_not_found_after_single_search(self):
+    def test_missing_result_returns_not_found_after_single_search_without_result_wait(self):
         page = Mock()
         page.url = "https://www.audipartsgiant.com/"
         search_box = Mock()
         with (
             patch("scrape_audi.dismiss_blocking_popups"),
             patch("scrape_audi.find_search_box", return_value=search_box),
-            patch("scrape_audi.wait_for_matching_result", return_value=None),
+            patch("scrape_audi.find_matching_result", return_value=None),
             patch("scrape_audi.wait_for_human_verification"),
+            patch("scrape_audi.has_vehicle_selection_popup", return_value=False),
             patch("scrape_audi.is_product_detail_page", return_value=False),
         ):
             result = crawl_msrp(page, "06H115403", [])
         self.assertEqual(result, (None, "not_found"))
         search_box.fill.assert_called_once_with("06H115403")
         search_box.press.assert_called_once_with("Enter")
+        page.wait_for_url.assert_called_once()
+        self.assertEqual(page.wait_for_url.call_args.kwargs["timeout"], 3_000)
+
+    def test_vehicle_selection_popup_skips_oem_immediately(self):
+        page = Mock()
+        page.url = "https://www.audipartsgiant.com/"
+        search_box = Mock()
+        with (
+            patch("scrape_audi.dismiss_blocking_popups") as dismiss,
+            patch("scrape_audi.find_search_box", return_value=search_box),
+            patch("scrape_audi.wait_for_human_verification"),
+            patch("scrape_audi.has_vehicle_selection_popup", return_value=True),
+        ):
+            result = crawl_msrp(page, "06H115403", [])
+        self.assertEqual(result, (None, "not_found"))
+        dismiss.assert_called()
+        page.wait_for_url.assert_called_once()
 
     def test_direct_search_navigation_extracts_audi_msrp(self):
         page = Mock()
@@ -112,6 +130,7 @@ Ships in 1-2 Business Days"""
             patch("scrape_audi.dismiss_blocking_popups") as dismiss_popups,
             patch("scrape_audi.find_search_box", return_value=search_box),
             patch("scrape_audi.wait_for_human_verification"),
+            patch("scrape_audi.has_vehicle_selection_popup", return_value=False),
             patch("scrape_audi.wait_for_product_msrp", return_value=price_text),
         ):
             result = crawl_msrp(page, "06L115562B", [])
