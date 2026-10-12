@@ -9,7 +9,7 @@ import time
 import urllib.request
 from datetime import date
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font
@@ -146,13 +146,29 @@ def _part_tokens(value: str) -> set[str]:
     return normalized
 
 
+def _edit_distance(first: str, second: str) -> int:
+    previous = list(range(len(second) + 1))
+    for first_index, first_char in enumerate(first, start=1):
+        current = [first_index]
+        for second_index, second_char in enumerate(second, start=1):
+            current.append(
+                min(
+                    current[-1] + 1,
+                    previous[second_index] + 1,
+                    previous[second_index - 1] + (first_char != second_char),
+                )
+            )
+        previous = current
+    return previous[-1]
+
+
 def find_matching_result(page: Page, oem_number: object) -> Locator | None:
     expected = normalize_part_number(oem_number)
     if not expected:
         return None
     links = page.locator('a[href*="/oem-parts/"]')
     matches: list[tuple[int, int]] = []
-    unique_products: dict[str, Locator] = {}
+    unique_products: dict[str, tuple[int, Locator]] = {}
     for index in range(links.count()):
         link = links.nth(index)
         try:
@@ -164,7 +180,7 @@ def find_matching_result(page: Page, oem_number: object) -> Locator | None:
             continue
         if not href:
             continue
-        unique_products.setdefault(href, link)
+        unique_products.setdefault(href, (index, link))
         if normalize_part_number(label) == expected or expected in _part_tokens(label):
             matches.append((0, index))
         elif expected in _part_tokens(href):
@@ -175,13 +191,27 @@ def find_matching_result(page: Page, oem_number: object) -> Locator | None:
 
     parsed_url = urlparse(page.url)
     submitted_values = parse_qs(parsed_url.query).get("search_str", [])
-    if (
+    is_exact_search = (
         parsed_url.hostname == urlparse(SITE_URL).hostname
         and parsed_url.path.rstrip("/") == "/search"
         and any(normalize_part_number(value) == expected for value in submitted_values)
-        and len(unique_products) == 1
-    ):
-        return next(iter(unique_products.values()))
+    )
+    if is_exact_search and unique_products:
+        ranked_products: list[tuple[int, int, Locator]] = []
+        for href, (index, link) in unique_products.items():
+            part_number = "".join(re.findall(r"\d+", urlparse(href).path.rsplit("-", 1)[-1]))
+            if not part_number:
+                continue
+            distance = _edit_distance(expected, part_number)
+            if expected.startswith(part_number) or part_number.startswith(expected):
+                distance = min(distance, abs(len(expected) - len(part_number)))
+            if distance <= max(2, len(expected) // 4):
+                ranked_products.append((distance, index, link))
+        if ranked_products:
+            ranked_products.sort(key=lambda product: (product[0], product[1]))
+            return ranked_products[0][2]
+        if len(unique_products) == 1:
+            return next(iter(unique_products.values()))[1]
     return None
 
 
@@ -234,6 +264,7 @@ def detail_status(body_text: str, oem_number: object, msrp: float | None) -> str
 
 
 def crawl_msrp(page: Page, oem_number: object, challenge_failures: list[str]) -> tuple[float | None, str]:
+    selected_detail_url = ""
     search_box = find_search_box(page)
     if search_box is None:
         wait_for_human_verification(page, challenge_failures)
@@ -254,6 +285,10 @@ def crawl_msrp(page: Page, oem_number: object, challenge_failures: list[str]) ->
         if result is None:
             print(f"  No exact search result matched OEM {oem_number!s}.")
             return None, "not_found"
+        result_href = result.get_attribute("href") or ""
+        if not isinstance(result_href, str):
+            result_href = ""
+        selected_detail_url = urljoin(page.url, result_href) if result_href else ""
         try:
             result.click(timeout=10_000)
         except PlaywrightTimeoutError:
@@ -264,7 +299,12 @@ def crawl_msrp(page: Page, oem_number: object, challenge_failures: list[str]) ->
             pass
         wait_for_human_verification(page, challenge_failures)
 
-    if not is_matching_detail_page(page, oem_number):
+    selected_result_opened = bool(
+        selected_detail_url
+        and urlparse(page.url)._replace(query="", fragment="").geturl()
+        == urlparse(selected_detail_url)._replace(query="", fragment="").geturl()
+    )
+    if not selected_result_opened and not is_matching_detail_page(page, oem_number):
         print(f"  Opened BMW detail page did not match OEM {oem_number!s}.")
         return None, "not_found"
     detail_text = page.locator("body").inner_text(timeout=15_000)

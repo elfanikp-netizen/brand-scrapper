@@ -80,6 +80,24 @@ class BMWCrawlerTests(unittest.TestCase):
 
         self.assertIs(find_matching_result(page, "41007496138"), replacement)
 
+    def test_multiple_close_results_choose_smallest_part_number_distance(self):
+        closest = Mock()
+        closest.is_visible.return_value = True
+        closest.inner_text.return_value = "63-21-7-888-850"
+        closest.get_attribute.return_value = "/oem-parts/bmw-back-up-light-assembly-63217888850"
+        next_closest = Mock()
+        next_closest.is_visible.return_value = True
+        next_closest.inner_text.return_value = "63-21-7-888-852"
+        next_closest.get_attribute.return_value = "/oem-parts/bmw-rear-light-63217888852"
+        links = Mock()
+        links.count.return_value = 2
+        links.nth.side_effect = lambda index: (closest, next_closest)[index]
+        page = Mock()
+        page.url = "https://www.getbmwparts.com/search?search_str=6321788885"
+        page.locator.return_value = links
+
+        self.assertIs(find_matching_result(page, "6321788885"), closest)
+
     def test_detail_page_replaces_field_confirms_searched_oem(self):
         page = Mock()
         page.url = "https://www.getbmwparts.com/oem-parts/bmw-fender-41009633544"
@@ -107,6 +125,28 @@ class BMWCrawlerTests(unittest.TestCase):
         self.assertEqual(result, (24.5, "success"))
         search_box.fill.assert_called_once_with("11-42-7-566-327")
         matching_result.click.assert_called_once_with(timeout=10_000)
+
+    def test_crawl_accepts_selected_candidate_detail_without_replaces_field(self):
+        page = Mock()
+        page.url = "https://www.getbmwparts.com/search?search_str=6321788885"
+        search_box = Mock()
+        matching_result = Mock()
+        matching_result.get_attribute.return_value = "/oem-parts/bmw-back-up-light-assembly-63217888850"
+        matching_result.click.side_effect = lambda **_: setattr(
+            page, "url", "https://www.getbmwparts.com/oem-parts/bmw-back-up-light-assembly-63217888850"
+        )
+        page.locator.return_value.inner_text.return_value = (
+            "Genuine BMW Back Up Light Assembly - Part Number 63-21-7-888-850\nMSRP: $304.22"
+        )
+        with (
+            patch("scrape_bmw.find_search_box", return_value=search_box),
+            patch("scrape_bmw.wait_for_human_verification"),
+            patch("scrape_bmw.is_matching_detail_page", return_value=False),
+            patch("scrape_bmw.wait_for_matching_result", return_value=matching_result),
+        ):
+            result = crawl_msrp(page, "6321788885", [])
+
+        self.assertEqual(result, (304.22, "success_superseded: 63-21-7-888-850"))
 
     def test_detail_status_reports_superseded_part(self):
         self.assertEqual(
