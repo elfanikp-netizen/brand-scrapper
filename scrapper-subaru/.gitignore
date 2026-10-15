@@ -1,0 +1,5 @@
+.browser-profile/
+.chrome-profile-subaru/
+__pycache__/
+*.py[cod]
+*_results.xlsx
